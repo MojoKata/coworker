@@ -270,11 +270,12 @@ class Install(Case):
     def test_dry_run_prints_both_parts_and_runs_nothing(self):
         p = self.project("one", {"host": [{"package": "a", "min": "1.2", "why": "w"}],
                                  "pips": [{"pip": "pillow", "min": "13.0.0", "why": "w"}]})
-        out = self.deps("install", "-n", p, rc=0).stdout.splitlines()
+        res = self.deps("install", "--dry-run", p, rc=0)
         py = self.env["COWORKER_PYTHON"]
-        self.assertEqual(out, [f"{py} -m pip install --user 'pillow>=13.0.0'",
-                               "# as root (sudo ~/coworker/bin/deps install --sudo): dnf install -y 'a >= 1.2'"])
-        self.assertEqual(self.deps("install", "--sudo", "-n", p, rc=0, **self.ROOT).stdout.strip(), "dnf install -y 'a >= 1.2'")
+        self.assertEqual(res.stdout.splitlines(), [f"{py} -m pip install --user 'pillow>=13.0.0'"])
+        self.assertIn("# as root (sudo ~/coworker/bin/deps install --sudo): dnf install -y 'a >= 1.2'", res.stderr)
+        self.assertEqual(self.deps("install", "--sudo", "--dry-run", p, rc=0, **self.ROOT).stdout.strip(), "dnf install -y 'a >= 1.2'")
+        self.assertEqual(self.deps("install", "-n", p, rc=0).stdout, res.stdout)        # -n is the short name
         self.assertEqual(self.log(), [])
 
     def test_apt_gets_names_and_pins(self):
@@ -286,7 +287,7 @@ class Install(Case):
     def test_nothing_missing_says_so(self):
         p = self.project("one", {"host": [{"package": "a", "why": "w"}]})
         self.assertIn("everything installed", self.deps("install", p, rc=0, FAKE_RPMS="a=1-1").stdout)
-        self.assertIn("no host packages", self.deps("install", "--sudo", p, rc=0, FAKE_RPMS="a=1-1", **self.ROOT).stdout)
+        self.assertIn("no host packages", self.deps("install", "--sudo", p, rc=0, FAKE_RPMS="a=1-1", **self.ROOT).stderr)
 
     def test_under_sudo_the_home_is_the_invoking_users(self):
         import pwd
@@ -304,7 +305,7 @@ class Remembered(Case):
         p = self.project("checkout", {"project": "one", "host": [{"package": "a", "why": "w"}]})
         self.deps("check", "--no-network", p, rc=1)
         self.assertEqual((self.home / "projects" / "one").read_text().strip(), p)
-        self.assertIn("dnf install -y a", self.deps("install", "-n", rc=0).stdout)
+        self.assertIn("dnf install -y a", self.deps("install", "--dry-run", rc=0).stderr)
 
     def test_a_remembered_checkout_that_is_gone_is_skipped_and_said(self):
         p = self.project("checkout", {"project": "one", "host": [{"package": "a", "why": "w"}]})

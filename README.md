@@ -217,8 +217,8 @@ install has two halves: what the user can install (the pips), which an agent run
 packages, which need root and which the machine's owner runs with `sudo`.
 
     deps check   [--no-network] [DIR...]
-    deps install [-n] [DIR...]                 as the user, never root
-    sudo ~/coworker/bin/deps install --sudo [-n] [DIR...]   as root only
+    deps install [--dry-run] [DIR...]                 as the user, never root
+    sudo ~/coworker/bin/deps install --sudo [--dry-run] [DIR...]   as root only
     deps hosts   [DIR...]
     deps register DIR
 
@@ -231,8 +231,9 @@ packages, which need root and which the machine's owner runs with `sudo`.
 - **`install --sudo`** (as root; it refuses otherwise) installs the missing host packages with one
   `dnf install` (or `apt-get install`), checks them again, and writes nothing in the user's home.
   Under `sudo`, which resets `HOME`, it finds the invoking user's coworker home through `SUDO_USER`.
-- **`-n`** prints the commands either half would run, and runs nothing. Each half stops at the
-  first command that fails.
+- **`--dry-run`** (`-n`) prints the commands that half would run, one per line on stdout, and runs
+  nothing; what's left for the other half (and the tools' installers) goes to stderr as `#` lines.
+  Each half stops at the first command that fails.
 - **`hosts`** lists every network host the projects need, whether it answers, and why it's needed:
   what to open on a firewall. `BLOCKED` is no answer (or not as far as the probe goes);
   `CERTIFICATE` is an answer with a certificate the system doesn't accept for that name, which a

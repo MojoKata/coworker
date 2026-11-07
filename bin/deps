@@ -3,10 +3,10 @@
 one's .coworker/deps.json. README.md, "Dependencies".
 
   deps check   [--no-network] [DIR...]  what's missing, out of range or unreachable (exit 1 if any)
-  deps install [-n] [DIR...]            as the user (never root): installs the missing pips (--user),
+  deps install [--dry-run] [DIR...]     as the user (never root): installs the missing pips (--user),
                                         then says which host packages are left for the --sudo run
-  sudo deps install --sudo [-n] [DIR...]  as root only: installs the missing host packages (dnf/apt)
-                                        -n: print the commands, run nothing
+  sudo deps install --sudo [--dry-run] [DIR...]  as root only: installs the missing host packages
+                                        --dry-run (-n): print the commands it would run, run nothing
   deps hosts   [DIR...]                 every network host needed, and whether it answers
   deps register DIR                     remember the project; one line if the host lacks any of its
                                         needs; exit 0 (2 only for a broken deps.json)
@@ -51,7 +51,7 @@ def coworker_home():
 
 HOME = coworker_home()
 PYTHON = os.environ.get("COWORKER_PYTHON", "python3")
-USAGE = ("usage: deps check [--no-network] [DIR...] | install [-n] [DIR...] | install --sudo [-n] [DIR...] (as root)"
+USAGE = ("usage: deps check [--no-network] [DIR...] | install [--dry-run] [DIR...] | install --sudo [--dry-run] [DIR...] (as root)"
          " | hosts [DIR...] | register DIR | vm-claim VM DIR | vm-guest VM [--wait SECONDS]")
 SSH = os.environ.get("COWORKER_SSH", "ssh")
 SUDO_HINT = "sudo ~/coworker/bin/deps install --sudo"
@@ -499,7 +499,7 @@ def host_command(rows):
         else:
             specs.append(name)
         if problem.startswith("above"):
-            print(f"# {name} is {problem}: dnf/apt won't downgrade it by itself")
+            print(f"# {name} is {problem}: dnf/apt won't downgrade it by itself", file=sys.stderr)
     if not specs:
         return []
     return [["dnf", "install", "-y", *specs] if fam == "rpm" else ["apt-get", "install", "-y", *specs]]
@@ -527,8 +527,8 @@ def run_all(cmds, dry):
 
 
 def install(args):
-    sudo, dry = "--sudo" in args, "-n" in args
-    args = [a for a in args if a not in ("--sudo", "-n")]
+    sudo, dry = "--sudo" in args, "-n" in args or "--dry-run" in args
+    args = [a for a in args if a not in ("--sudo", "-n", "--dry-run")]
     if sudo and euid() != 0:
         print(f"deps: install --sudo installs host packages and must run as root: {SUDO_HINT}", file=sys.stderr)
         return 2
@@ -538,7 +538,7 @@ def install(args):
     if sudo:        # root: the host packages only
         cmds = host_command(survey(args, network=False, pips=False))
         if not cmds:
-            print("# no host packages to install")
+            print("# no host packages to install", file=sys.stderr)
             return 0
         if not run_all(cmds, dry):
             return 1
@@ -555,11 +555,11 @@ def install(args):
     if not run_all(pip_commands(rows), dry):
         return 1
     tools = [r for r in rows if r[0] == "tool" and r[4]]
-    if dry:
+    if dry:     # stdout: only what this run would run; the other halves on stderr
         for argv in host_command(rows):
-            print("# as root (" + SUDO_HINT + "): " + " ".join(shlex.quote(a) for a in argv))
+            print("# as root (" + SUDO_HINT + "): " + " ".join(shlex.quote(a) for a in argv), file=sys.stderr)
         for _, name, want, _, _ in tools:
-            print(f"# {name}, by hand: {want['how']}")
+            print(f"# {name}, by hand: {want['how']}", file=sys.stderr)
         return 0
     left = [r for r in survey(args, network=False) if r[4]]
     if not left:
