@@ -26,6 +26,7 @@ Standard library only. COWORKER_PYTHON names the Python whose pips count (python
 COWORKER_FAMILY, COWORKER_TLS_CA and COWORKER_NET_TIMEOUT stand in for the machine's in tests.
 """
 
+import datetime
 import fnmatch
 import json
 import os
@@ -329,7 +330,7 @@ def check_vm(section, where):
         return
     if not isinstance(o, dict):
         raise Bad(f"{where}: os is an object")
-    extra = set(o) - {"family", "name", "version", "min", "max", "pin", "why"}
+    extra = set(o) - {"family", "name", "version", "min", "max", "pin", "updated_within_days", "why"}
     if extra:
         raise Bad(f"{where}: os: unknown key {sorted(extra)[0]!r}")
     if o.get("family") not in OS_FAMILIES:
@@ -338,6 +339,9 @@ def check_vm(section, where):
         raise Bad(f"{where}: os needs a 'why'")
     if "pin" in o and ("min" in o or "max" in o):
         raise Bad(f"{where}: os: a pin with a min or max")
+    d = o.get("updated_within_days")
+    if d is not None and (not isinstance(d, int) or isinstance(d, bool) or d < 1):
+        raise Bad(f"{where}: os: updated_within_days is a whole number of days, 1 or more")
 
 
 def project_name(folder):
@@ -809,6 +813,9 @@ def merge_os(vm, claims):
             else:
                 pick = max if bound == "min" else min
                 out[bound] = pick(out[bound], o[bound], key=lambda v: _Key(v, pipvercmp))
+        if "updated_within_days" in o:     # the strictest: every claimant's holds
+            out["updated_within_days"] = min(out.get("updated_within_days", o["updated_within_days"]),
+                                             o["updated_within_days"])
         out["from"].append(project)
         out["why"].append(o["why"])
         lo, hi = out.get("pin", out.get("min")), out.get("pin", out.get("max"))
@@ -820,6 +827,8 @@ def merge_os(vm, claims):
 def os_text(o):
     parts = [o.get("name", o["family"]), o.get("version", "")]
     spec = spec_text(o).replace("==", "build ").replace(">=", "build >= ").replace("<=", "build <= ")
+    if "updated_within_days" in o:
+        spec += f", updated within {o['updated_within_days']} days"
     return " ".join(p for p in parts + [spec] if p) + f"  [{', '.join(o['from'])}]"
 
 
@@ -876,6 +885,15 @@ GUEST_QUERY = {
 }
 
 
+def updated_on(vm):
+    """The day vms update last left the VM with nothing to install (<vm>/updated), or None."""
+    try:
+        with open(os.path.join(vm_folder(vm), "updated")) as f:
+            return datetime.date.fromisoformat(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def vm_guest(args):
     wait = 0.0
     if "--wait" in args:
@@ -916,6 +934,12 @@ def vm_guest(args):
     miss = in_range(build, o, pipvercmp)
     if miss:
         wrong.append(f"build {build} is {miss}")
+    if "updated_within_days" in o:
+        last = updated_on(vm)
+        age = (datetime.date.today() - last).days if last else None
+        if age is None or age > o["updated_within_days"]:
+            wrong.append(f"{'never fully updated by vms update' if age is None else f'last fully updated {age} days ago'}, "
+                         f"not within {o['updated_within_days']} (vms update {vm})")
     if wrong:
         raise Unmet(f"{vm} runs {have}: {'; '.join(wrong)}. Its projects need {os_text(o)}: "
                     f"{'; '.join(o['why'])}")

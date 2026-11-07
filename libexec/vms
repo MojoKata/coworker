@@ -12,12 +12,17 @@
 #   vms lock    VM PROJECT [--no-wait] -- COMMAND [ARG...]  run COMMAND holding VM's lock
 #   vms env     VM                                        how to reach VM, as assignments to eval
 #   vms list                                              every VM, its claims, and who holds it
+#   vms create  VM [--yes]                                build VM from its recipe ($COWORKER_HOME/recipes/VM),
+#                                                         replacing the one there (a human's call: --yes)
+#   vms update  VM                                        Windows Update until nothing is left, under the lock
 #
 # Beside each VM's folder (its README.md and vm.env): an empty VM.<project> per project that claims
 # it, and VM.lock, which names the holder while a run holds it.
 set -eu
-DIR=${COWORKER_HOME:-$HOME/coworker}/vms
-USAGE="usage: vms run VM DIR [--keep-vm] [--no-wait] -- COMMAND [ARG...] | claim VM PROJECT | release VM PROJECT | lock VM PROJECT [--no-wait] -- COMMAND [ARG...] | env VM | list"
+HOMEDIR=${COWORKER_HOME:-$HOME/coworker}
+DIR=$HOMEDIR/vms
+RECIPES=$HOMEDIR/recipes
+USAGE="usage: vms run VM DIR [--keep-vm] [--no-wait] -- COMMAND [ARG...] | claim VM PROJECT | release VM PROJECT | lock VM PROJECT [--no-wait] -- COMMAND [ARG...] | env VM | list | create VM [--yes] | update VM"
 DEPS="$(cd "$(dirname "$0")" && pwd)/deps"
 usage() { echo "$USAGE" >&2; exit 2; }
 
@@ -172,6 +177,176 @@ stop_started() {
     fi
 }
 
+# -- building and updating a VM (README.md, "VM recipes") ------------------------------------------
+
+vssh() {        # vssh no|yes COMMAND: ssh to the VM as vm.env says; "no": before known_hosts is written
+    if [ "$1" = no ]; then kh=/dev/null; strict=no; else kh=$VM_KNOWN_HOSTS; strict=yes; fi
+    "${COWORKER_SSH:-ssh}" -q -i "$VM_SSH_KEY" -p "$VM_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
+        -o "StrictHostKeyChecking=$strict" -o "UserKnownHostsFile=$kh" "$VM_SSH_USER@$VM_SSH_HOST" "$2"
+}
+wait_ssh() {    # wait_ssh no|yes SECONDS
+    end=$(( $(date +%s) + $2 ))
+    until vssh "$1" "echo up" 2>/dev/null | tr -d '\r' | grep -qx up; do
+        [ "$(date +%s)" -lt "$end" ] || { echo "vms: $VM: no SSH after $2 s" >&2; return 69; }
+        sleep "${COWORKER_VM_POLL:-15}"
+    done
+}
+guest_build() {
+    vssh yes '$v = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"; "10.0.$($v.CurrentBuild).$($v.UBR)"' | tr -d '\r' | tail -1
+}
+
+create() {      # a human's call: it replaces the VM every claimant uses (exit 3 without --yes)
+    [ $# -ge 1 ] || usage
+    VM=$(basename "$1"); shift
+    YES=0
+    [ "${1:-}" = --yes ] && YES=1
+    [ "${COWORKER_UNATTENDED:-}" = 1 ] && YES=1
+    R="$RECIPES/$VM"
+    [ -f "$R/recipe.env" ] || { echo "vms: no recipe for $VM in $RECIPES (README.md, \"VM recipes\")" >&2; exit 1; }
+    if [ "$YES" != 1 ]; then
+        c=$(claims_of "$VM")
+        echo "vms create $VM builds it from $R, replacing $DIR/$VM's (its disk is kept as storage-<date>-old)," >&2
+        echo "for every project that claims it:${c:- none yet}. It takes an hour or more. A human's call:" >&2
+        echo "    vms create $VM --yes" >&2
+        exit 3
+    fi
+    mkdir -p "$DIR/$VM"
+    lock "$VM" coworker -- create_locked
+}
+
+create_locked() {
+    H="$DIR/$VM"
+    . "$R/recipe.env"
+    cd "$H" || return 1
+    for f in ssh.sh scp.sh shot.sh keys.sh; do install -m 755 "$R/$f" "$f"; done
+    install -m 644 "$R/update.ps1" update.ps1
+    mkdir -p oem
+    install -m 644 "$R/oem/install.bat" "$R/oem/vmctl.py" oem/
+    [ -s password.txt ] || (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(18))' > password.txt)
+    [ -s vm_key ] || ssh-keygen -q -t ed25519 -N '' -C "coworker $VM" -f vm_key
+    cp vm_key.pub oem/authorized_key.pub
+    if ! echo "$OPENSSH_SHA256  oem/OpenSSH-Win64.zip" | sha256sum -c --quiet >/dev/null 2>&1; then
+        curl -fsSL -o oem/OpenSSH-Win64.zip.part "$OPENSSH_URL" || return 1
+        echo "$OPENSSH_SHA256  oem/OpenSSH-Win64.zip.part" | sha256sum -c --quiet || { echo "vms: $OPENSSH_URL isn't the file the recipe pins" >&2; return 1; }
+        mv oem/OpenSSH-Win64.zip.part oem/OpenSSH-Win64.zip
+    fi
+    C=coworker-$VM
+    cat > vm.env <<END
+# How projects reach this VM (the coworker README, "vm.env"), written by vms create from the recipe
+VM_OS="$VM_OS"
+VM_CONTAINER=$C
+VM_SSH_HOST=127.0.0.1
+VM_SSH_PORT=$SSH_PORT
+VM_SSH_USER=$USERNAME
+VM_SSH_KEY=vm_key
+VM_KNOWN_HOSTS=known_hosts
+END
+    if docker inspect "$C" >/dev/null 2>&1; then
+        docker stop -t 120 "$C" >/dev/null 2>&1 || true
+        docker rm "$C" >/dev/null || return 1
+    fi
+    if [ -d storage ]; then
+        old=storage-$(date +%Y%m%d-%H%M)-old
+        mv storage "$old"
+        echo "$VM: the old disk is $H/$old; delete it once the new VM works"
+    fi
+    mkdir storage
+    cp oem/vmctl.py storage/vmctl.py
+    set -- -v "$H/storage:/storage" -v "$H/oem:/oem"
+    if [ -n "${ISO:-}" ] && [ -f "$HOMEDIR/downloads/$ISO" ]; then set -- "$@" -v "$HOMEDIR/downloads/$ISO:/boot.iso:ro"; fi
+    docker run -d --name "$C" --device /dev/kvm --device /dev/net/tun --cap-add NET_ADMIN --stop-timeout 120 \
+        -e VERSION="$WIN_VERSION" -e RAM_SIZE="$RAM" -e CPU_CORES="$CPUS" -e DISK_SIZE="$DISK" \
+        -e USERNAME="$USERNAME" -e PASSWORD="$(cat password.txt)" -e USER_PORTS=22 \
+        -p "127.0.0.1:$WEB_PORT:8006" -p "127.0.0.1:$RDP_PORT:3389" -p "127.0.0.1:$SSH_PORT:22" \
+        "$@" "$IMAGE" >/dev/null || return 1
+    rm -f known_hosts
+    echo "$VM: installing $VM_OS (watch http://127.0.0.1:$WEB_PORT); SSH answers when setup has finished"
+    eval "$(env_of "$VM")"
+    wait_ssh no "${COWORKER_VM_INSTALL_WAIT:-7200}" || return $?
+    host_keys || return $?
+    update_rounds || return $?
+    printf '%s  built from the recipe of coworker %s\n' "$(date -u '+%Y-%m-%d %H:%M UTC')" "$(cat "$HOMEDIR/VERSION" 2>/dev/null || echo '?')" >> history
+    echo "$VM: built; stopping it (vms run starts it when a project needs it)"
+    docker stop -t 120 "$C" >/dev/null
+}
+
+host_keys() {   # known_hosts: the keys the guest says it has, as they answer on the port
+    vssh no 'Get-Content C:\ProgramData\ssh\ssh_host_*_key.pub' | tr -d '\r' > .keys.guest
+    "${COWORKER_SSH_KEYSCAN:-ssh-keyscan}" -p "$VM_SSH_PORT" "$VM_SSH_HOST" 2>/dev/null > .keys.scan
+    : > known_hosts.new
+    while read -r t k _; do
+        grep " $t $k\$" .keys.scan >> known_hosts.new || true
+    done < .keys.guest
+    rm -f .keys.guest .keys.scan
+    [ -s known_hosts.new ] || { rm -f known_hosts.new; echo "vms: $VM: no host key the guest names answers on port $VM_SSH_PORT" >&2; return 69; }
+    mv known_hosts.new known_hosts
+}
+
+update_rounds() { # Windows Update as SYSTEM (update.ps1), rebooting as it asks, until nothing is left
+    vssh yes 'New-Item -ItemType Directory -Force C:\coworker | Out-Null' >/dev/null || return 69
+    i=0
+    while [ "$i" -lt "${COWORKER_VM_UPDATE_ROUNDS:-8}" ]; do
+        i=$((i + 1))
+        "${COWORKER_SCP:-scp}" -q -i "$VM_SSH_KEY" -P "$VM_SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$VM_KNOWN_HOSTS" \
+            "$VM_HOME/update.ps1" "$VM_SSH_USER@$VM_SSH_HOST:C:/coworker/update.ps1" || return 69
+        vssh yes "Remove-Item C:\coworker\update.result -ErrorAction SilentlyContinue
+            schtasks /create /tn coworker-update /tr 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\coworker\update.ps1' /sc once /st 23:59 /ru SYSTEM /rl HIGHEST /f | Out-Null
+            schtasks /run /tn coworker-update | Out-Null" >/dev/null || return 69
+        echo "$VM: Windows Update, round $i"
+        end=$(( $(date +%s) + ${COWORKER_VM_UPDATE_WAIT:-10800} ))
+        res=""
+        while [ -z "$res" ]; do
+            [ "$(date +%s)" -lt "$end" ] || { echo "vms: $VM: round $i didn't finish in ${COWORKER_VM_UPDATE_WAIT:-10800} s" >&2; return 1; }
+            sleep "${COWORKER_VM_POLL:-15}"
+            res=$(vssh yes 'Get-Content C:\coworker\update.result -ErrorAction SilentlyContinue' | tr -d '\r' | grep -E '^(DONE|FAILED)' || true)
+        done
+        echo "$VM: $res"
+        case $res in FAILED*) echo "vms: $VM: Windows Update failed (C:\coworker\update.log)" >&2; return 1 ;; esac
+        set -- $res
+        inst=${2#installed=}; bad=${3#failed=}; boot=${4#reboot=}
+        if [ "$boot" = 1 ]; then
+            echo "$VM: restarting, as Windows Update asks"
+            vssh yes 'shutdown /r /t 5' >/dev/null || true
+            sleep "${COWORKER_VM_REBOOT_PAUSE:-90}"
+            wait_ssh yes "${COWORKER_VM_BOOT_WAIT:-1800}" || return $?
+            continue
+        fi
+        if [ "$inst" = 0 ]; then
+            [ "$bad" = 0 ] || { echo "vms: $VM: $bad update(s) keep failing to install (C:\coworker\update.log)" >&2; return 1; }
+            b=$(guest_build)
+            printf '%s %s\n' "$(date -u +%Y-%m-%d)" "$b" > "$VM_HOME/updated"
+            echo "$VM: up to date, build $b"
+            return 0
+        fi
+    done
+    echo "vms: $VM: Windows Update still had updates after $i rounds" >&2
+    return 1
+}
+
+update() {
+    [ $# -ge 1 ] || usage
+    VM=$(basename "$1")
+    [ -f "$DIR/$VM/update.ps1" ] || { echo "vms: $DIR/$VM has no update.ps1: build it with vms create (README.md, \"VM recipes\")" >&2; exit 1; }
+    lock "$VM" coworker -- update_locked
+}
+
+update_locked() {
+    eval "$(env_of "$VM")"
+    export VM_HOME VM_OS VM_CONTAINER VM_SSH_HOST VM_SSH_PORT VM_SSH_USER VM_SSH_KEY VM_KNOWN_HOSTS
+    STARTED=0; KEEP=0; P=coworker
+    if [ -n "$VM_CONTAINER" ] && [ "$(docker inspect -f '{{.State.Running}}' "$VM_CONTAINER" 2>/dev/null)" != true ]; then
+        echo "starting $VM ($VM_CONTAINER)"
+        docker start "$VM_CONTAINER" >/dev/null || { echo "vms: couldn't start $VM_CONTAINER" >&2; return 69; }
+        STARTED=1
+        trap 'stop_started; exit 130' INT TERM HUP
+    fi
+    rc=0
+    wait_ssh yes "${COWORKER_VM_BOOT_WAIT:-900}" || rc=$?
+    [ "$rc" = 0 ] && { update_rounds || rc=$?; }
+    stop_started
+    return "$rc"
+}
+
 list() {
     [ -d "$DIR" ] || { echo "no $DIR"; return 0; }
     cd "$DIR"
@@ -197,5 +372,7 @@ case $cmd in
     lock) client; lock "$@" ;;
     env) env_of "$@" ;;
     list) list ;;
+    create) client; create "$@" ;;
+    update) client; update "$@" ;;
     *) echo "$USAGE" >&2; exit 2 ;;
 esac

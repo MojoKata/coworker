@@ -1,7 +1,8 @@
 #!/bin/sh
 # install.sh [--change]: installs the coworker commands from this checkout into $COWORKER_HOME
 # (~/coworker unless set): libexec/downloads, libexec/vms and libexec/deps as bin/* (copies, not
-# links), .coworker/deps.json (coworker's own needs), PROTOCOL, and VERSION, what this checkout is
+# links), .coworker/deps.json (coworker's own needs), vms/ as recipes/ (vms create), PROTOCOL, and
+# VERSION, what this checkout is
 # (git describe). Creates downloads/ and vms/ there if missing and never touches what's in them.
 #
 # A human's call (or their say-so): a project runs it as <checkout>/coworker/bin/coworker install.
@@ -36,6 +37,9 @@ for f in downloads vms deps; do
 done
 install -m 644 "$HERE/.coworker/deps.json" "$H/.coworker/.deps.json.new"
 mv -f "$H/.coworker/.deps.json.new" "$H/.coworker/deps.json"     # coworker's own needs (deps check)
+rm -rf "$H/.recipes.new"                         # the VM recipes (vms create): replaced whole
+cp -R "$HERE/vms" "$H/.recipes.new"
+rm -rf "$H/recipes" && mv "$H/.recipes.new" "$H/recipes"
 install -m 644 "$HERE/PROTOCOL" "$H/.PROTOCOL.new"
 mv -f "$H/.PROTOCOL.new" "$H/PROTOCOL"
 v=$(git -C "$HERE" describe --tags --always --dirty 2>/dev/null || echo unknown)
