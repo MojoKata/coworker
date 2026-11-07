@@ -285,6 +285,20 @@ class Remembered(Case):
         self.assertIn("one:", res.stderr)
 
 
+class Register(Case):
+    def test_register_remembers_and_only_mentions_what_is_missing(self):
+        p = self.project("checkout", {"project": "one", "host": [{"package": "a", "why": "w"}, {"package": "b", "why": "w"}]})
+        res = self.deps("register", p, rc=0, FAKE_RPMS="b=1-1")
+        self.assertEqual(res.stdout, "")
+        self.assertIn("lacks 1 of one's needs (a)", res.stderr)
+        self.assertEqual((self.home / "projects" / "one").read_text().strip(), p)
+        self.assertEqual(self.deps("register", p, rc=0, FAKE_RPMS="a=1-1 b=1-1").stderr, "")
+
+    def test_a_broken_deps_json_still_fails(self):
+        p = self.project("checkout", {"host": [{"package": "a"}]})
+        self.assertIn("needs a 'why'", self.deps("register", p, rc=2).stderr)
+
+
 class Network(Case):
     """Local servers: one that speaks TLS, one that answers HTTP, one that accepts and never answers
     (what a firewall that filters by name looks like), and a closed port."""

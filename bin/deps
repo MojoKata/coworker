@@ -8,6 +8,8 @@ one's .coworker/deps.json. README.md, "Dependencies".
   sudo deps install --sudo [-n] [DIR...]  as root only: installs the missing host packages (dnf/apt)
                                         -n: print the commands, run nothing
   deps hosts   [DIR...]                 every network host needed, and whether it answers
+  deps register DIR                     remember the project; one line if the host lacks any of its
+                                        needs; exit 0 (2 only for a broken deps.json)
   deps vm-claim VM DIR                  for vms run: claim VM with DIR's needs of it, merge every
                                         claimant's, check the host side (exit 1 missing, 65 clash)
   deps vm-guest VM [--wait SECONDS]     for vms run: the running guest meets the merged needs (69 not)
@@ -50,7 +52,7 @@ def coworker_home():
 HOME = coworker_home()
 PYTHON = os.environ.get("COWORKER_PYTHON", "python3")
 USAGE = ("usage: deps check [--no-network] [DIR...] | install [-n] [DIR...] | install --sudo [-n] [DIR...] (as root)"
-         " | hosts [DIR...] | vm-claim VM DIR | vm-guest VM [--wait SECONDS]")
+         " | hosts [DIR...] | register DIR | vm-claim VM DIR | vm-guest VM [--wait SECONDS]")
 SSH = os.environ.get("COWORKER_SSH", "ssh")
 SUDO_HINT = "sudo ~/coworker/bin/deps install --sudo"
 KEYS = {"host": "package", "pips": "pip", "network": "host"}
@@ -561,6 +563,23 @@ def hosts(args):
     return 1 if any(r[4] for r in rows) else 0
 
 
+def register(args):
+    """For any project script's first line: remember the checkout, and say (not fail) if the host
+    lacks something the project needs."""
+    if len(args) != 1:
+        raise Bad("usage: deps register DIR")
+    folder = os.path.abspath(args[0])
+    data = load(folder)
+    project = data.get("project") or os.path.basename(folder)
+    if euid() != 0:
+        remember(folder, project)
+    left = [r for r in survey_from(wanted_from([(project, data)]), network=False) if r[4]]
+    if left:
+        print(f"coworker: the host lacks {len(left)} of {project}'s needs ({', '.join(r[1] for r in left[:3])}"
+              f"{', ...' if len(left) > 3 else ''}): {os.path.join(HOME, 'bin', 'deps')} check {folder}", file=sys.stderr)
+    return 0
+
+
 # -- shared VMs (vms run) ----------------------------------------------------------------------
 
 def vm_folder(vm):
@@ -756,11 +775,11 @@ def vm_guest(args):
 
 
 def main(argv):
-    if not argv or argv[0] not in ("check", "install", "hosts", "vm-claim", "vm-guest"):
+    if not argv or argv[0] not in ("check", "install", "hosts", "register", "vm-claim", "vm-guest"):
         print(USAGE, file=sys.stderr)
         return 2
     try:
-        return {"check": check, "install": install, "hosts": hosts,
+        return {"check": check, "install": install, "hosts": hosts, "register": register,
                 "vm-claim": vm_claim, "vm-guest": vm_guest}[argv[0]](argv[1:])
     except Bad as e:
         print(f"deps: {e}", file=sys.stderr)

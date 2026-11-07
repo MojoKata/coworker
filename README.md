@@ -220,6 +220,7 @@ packages, which need root and which the machine's owner runs with `sudo`.
     deps install [-n] [DIR...]                 as the user, never root
     sudo ~/coworker/bin/deps install --sudo [-n] [DIR...]   as root only
     deps hosts   [DIR...]
+    deps register DIR
 
 - **`check`** lists every need with what's installed and whether it's met, and whether each host
   answers. Exit 1 if anything is missing, out of range or unreachable; 2 if a `deps.json` is wrong or
@@ -236,6 +237,14 @@ packages, which need root and which the machine's owner runs with `sudo`.
   what to open on a firewall. `BLOCKED` is no answer (or not as far as the probe goes);
   `CERTIFICATE` is an answer with a certificate the system doesn't accept for that name, which a
   firewall rule doesn't fix.
+
+- **`register`** is for the first line of a project's scripts: it remembers the checkout and, if the
+  host lacks any of the project's needs, says so in one line on stderr. It never fails the script
+  (exit 2 only for a broken `deps.json`): a script that uses a shared VM gets its real check from
+  `vms run`, and a project's other needs are for whoever runs `deps check`.
+
+      CW=${COWORKER_HOME:-$HOME/coworker}
+      [ -x "$CW/bin/deps" ] && "$CW/bin/deps" register "$HERE"
 
 A `DIR` is a project's checkout. Coworker's own `deps.json` (installed with the commands) always
 counts too. Each `DIR` is remembered in `$COWORKER_HOME/projects/<project>` (a file holding the
