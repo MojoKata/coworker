@@ -68,8 +68,8 @@ USAGE = ("usage: deps check [--no-network] [DIR...] | install [--dry-run] [DIR..
 PROTOCOL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "PROTOCOL")
 SSH = os.environ.get("COWORKER_SSH", "ssh")
 SUDO_HINT = f"sudo {os.path.join(HOME, 'bin', 'deps')} install --sudo (or that, as root)"
-KEYS = {"host": "package", "pips": "pip", "network": "host", "tools": "tool"}
-ENTRY_KEYS = {"platform", "min", "max", "pin", "why", "port", "probe", "command", "path", "how"}
+KEYS = {"host": "package", "pips": "pip", "network": "host", "tools": "tool", "container_images": "image"}
+ENTRY_KEYS = {"platform", "min", "max", "pin", "why", "port", "probe", "command", "path", "how", "built", "from"}
 
 
 class Bad(Exception):
@@ -302,6 +302,13 @@ def check_lists(data, path):
                 raise Bad(f"{where} ({e[name_key]}): a pin with a min or max")
             if kind == "network" and set(e) & {"min", "max", "pin"}:
                 raise Bad(f"{where} ({e[name_key]}): a host has no version")
+            if kind == "container_images":
+                if set(e) & {"min", "max", "pin", "port", "probe", "command", "path", "how"}:
+                    raise Bad(f"{where} ({e[name_key]}): a container image has image, built, from, platform and why")
+                check_image(e, where)
+                continue
+            if set(e) & {"built", "from"}:
+                raise Bad(f"{where} ({e[name_key]}): built and from are a container image's")
             if kind == "tools":
                 if set(e) & {"min", "max", "pin", "port", "probe"}:
                     raise Bad(f"{where} ({e[name_key]}): a tool is checked by its command or path only")
@@ -322,7 +329,7 @@ def check_vm(section, where):
     if not isinstance(section, dict):
         raise Bad(f"{where}: a VM's needs are an object")
     for k in section:
-        if k not in KEYS and k != "os":
+        if (k not in KEYS or k == "container_images") and k != "os":
             raise Bad(f"{where}: unknown key {k!r} (os, host, pips, network, tools)")
     check_lists(section, where)
     o = section.get("os")
@@ -459,6 +466,13 @@ def wanted_from(sources):
                     probe = e.get("probe", default_probe(e.get("port", 443)))
                     if w.setdefault("probe", probe) != probe:
                         raise Clash(f"{name}: probed as {w['probe']} and as {probe} ({', '.join(w['from'])})")
+                if kind == "container_images" and "built" in e:
+                    w.setdefault("built", e["built"])
+                    for b in e.get("from", []):      # its bases are claimed too
+                        bw = out[kind].setdefault(b, {"from": [], "why": []})
+                        if label not in bw["from"]:
+                            bw["from"].append(label)
+                            bw["why"].append(f"{name} is built from it")
                 w["from"].append(label)
                 w["why"].append(e["why"])
                 for bound in ("min", "max", "pin"):
@@ -488,8 +502,8 @@ class _Key:
 
 # -- the commands -------------------------------------------------------------------------------
 
-def survey(args, network=True, pips=True, tools=True):
-    return survey_from(wanted(args), network, pips, tools)
+def survey(args, network=True, pips=True, tools=True, images=True):
+    return survey_from(wanted(args), network, pips, tools, images)
 
 
 def user_path(p):
@@ -504,7 +518,205 @@ def user_path(p):
     return os.path.expanduser(p)
 
 
-def survey_from(w, network=True, pips=True, tools=True):
+# -- container images (README.md, "Container images") ---------------------------------------------
+
+DOCKER = os.environ.get("COWORKER_DOCKER", "docker")
+
+
+def image_parts(ref):
+    """(repository, tag, digest) of an image reference; tag and digest may be None."""
+    rest, _, digest = ref.partition("@")
+    slash = rest.rfind("/")
+    colon = rest.rfind(":")
+    if colon > slash:
+        return rest[:colon], rest[colon + 1:], digest or None
+    return rest, None, digest or None
+
+
+def check_image(e, where):
+    ref = e["image"]
+    repo, tag, digest = image_parts(ref)
+    if "built" in e:
+        if not isinstance(e["built"], str) or not e["built"].strip():
+            raise Bad(f"{where} ({ref}): built names the script that builds it")
+        if tag or digest:
+            raise Bad(f"{where} ({ref}): a built image is named by its repository alone (its tag changes as it's rebuilt)")
+        bases = e.get("from", [])
+        if not isinstance(bases, list) or not all(isinstance(b, str) and b for b in bases):
+            raise Bad(f"{where} ({ref}): from is a list of the images it's built from")
+        for b in bases:
+            if not (image_parts(b)[1] or image_parts(b)[2]):
+                raise Bad(f"{where} ({ref}): from {b!r}: name its tag or digest")
+    else:
+        if "from" in e:
+            raise Bad(f"{where} ({ref}): from is a built image's (with built)")
+        if not (tag or digest):
+            raise Bad(f"{where} ({ref}): name its tag or digest (a bare name means whatever :latest is)")
+
+
+def local_images():
+    """[{id, tags, digests, size, created}] for every image docker has, or None without docker."""
+    if not shutil.which(DOCKER):
+        return None
+    ids = subprocess.run([DOCKER, "image", "ls", "-q", "--no-trunc"], capture_output=True, text=True)
+    if ids.returncode != 0:
+        return None
+    ids = sorted(set(ids.stdout.split()))
+    if not ids:
+        return []
+    r = subprocess.run([DOCKER, "image", "inspect", *ids], capture_output=True, text=True)
+    out = []
+    for i in json.loads(r.stdout or "[]"):
+        out.append({"id": i["Id"], "tags": i.get("RepoTags") or [], "digests": i.get("RepoDigests") or [],
+                    "size": i.get("Size", 0), "created": i.get("Created", "")})
+    return out
+
+
+def image_matches(ref, img):
+    repo, tag, digest = image_parts(ref)
+    if digest:
+        return f"{repo}@{digest}" in img["digests"]
+    return f"{repo}:{tag}" in img["tags"]
+
+
+def image_rows(wants, images):
+    """survey rows for container images. None missing is a problem: docker pulls a pulled one when a
+    script first runs it (deps install pulls them ahead), and a built one's script builds it. Only no
+    docker is."""
+    rows = []
+    built = {r for r, w in wants.items() if "built" in w}
+    for ref, want in sorted(wants.items()):
+        if images is None:
+            rows.append(("image", ref, want, "no docker", "missing"))
+        elif image_parts(ref)[0] in built and "built" not in want:
+            continue                                    # a built image used as another's base: its own row
+        elif "built" in want:
+            mine = [i for i in images if any(image_parts(t)[0] == ref for t in i["tags"])]
+            rows.append(("image", ref, want, f"{len(mine)} build(s)" if mine else f"not built yet ({want['built']})", None))
+        else:
+            here = any(image_matches(ref, i) for i in images)
+            rows.append(("image", ref, want, "here" if here else "not here (pulled on first use)", None))
+    return rows
+
+
+def pull_commands(rows):
+    return [[DOCKER, "pull", name] for kind, name, want, state, problem in rows
+            if kind == "image" and state.startswith("not here")]
+
+
+def size_text(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+
+
+def recipe_images():
+    """{image: [label]} for the VM recipes' images: each VM's, claimed by the VM."""
+    out = {}
+    d = os.path.join(HOME, "recipes")
+    for vm in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        try:
+            with open(os.path.join(d, vm, "recipe.env")) as f:
+                for line in f:
+                    m = re.match(r"\s*IMAGE=(\S+)", line)
+                    if m:
+                        claims = [p for p, _ in vm_claims(vm)] if os.path.isdir(vm_folder(vm)) else []
+                        out.setdefault(m.group(1), []).append(f"the VM {vm}" + (f" ({', '.join(claims)})" if claims else ""))
+        except OSError:
+            pass
+    return out
+
+
+def classify(images, wants, recipes):
+    """For each local image: (status, claimants, what it was matched as)."""
+    pulled = {r: w for r, w in wants.items() if "built" not in w}
+    pulled.update({r: {"from": who} for r, who in recipes.items()})
+    built = {r: w for r, w in wants.items() if "built" in w}
+    newest = {}
+    for i in images:
+        for t in i["tags"]:
+            repo = image_parts(t)[0]
+            if repo in built and i["created"] > newest.get(repo, ("", None))[0]:
+                newest[repo] = (i["created"], i["id"])
+    out = {}
+    for i in images:
+        hit = [r for r in pulled if image_matches(r, i)]
+        if hit:
+            out[i["id"]] = ("claimed", sorted({p for r in hit for p in pulled[r]["from"]}), hit[0])
+            continue
+        mine = sorted({image_parts(t)[0] for t in i["tags"]} & set(built))
+        if mine:
+            current = any(newest[r][1] == i["id"] for r in mine)
+            out[i["id"]] = ("claimed" if current else "superseded", sorted({p for r in mine for p in built[r]["from"]}),
+                            mine[0])
+            continue
+        repos = {image_parts(t)[0] for t in i["tags"]} | {image_parts(d)[0] for d in i["digests"]}
+        near = sorted(r for r in pulled if image_parts(r)[0] in repos)
+        if near:
+            out[i["id"]] = ("near miss", [], near[0])
+        else:
+            out[i["id"]] = ("undeclared" if i["tags"] else "dangling", [], None)
+    return out
+
+
+def containers(args):
+    """containers list | containers remove [--yes]"""
+    if not args or args[0] not in ("list", "remove"):
+        raise Bad("usage: containers list | containers remove [--yes]")
+    images = local_images()
+    if images is None:
+        raise Bad("containers: no docker here (or it doesn't answer)")
+    wants = wanted([])["container_images"]
+    recipes = recipe_images()
+    status = classify(images, wants, recipes)
+    name = lambda i: (i["tags"] or [d.split("@")[0] + "@" + d.split("@")[1][:19] for d in i["digests"]] or [i["id"][7:19]])[0]
+    removable = [i for i in images if status[i["id"]][0] in ("superseded", "near miss", "undeclared", "dangling")]
+    if args[0] == "list":
+        for i in sorted(images, key=lambda i: (status[i["id"]][0] != "claimed", name(i))):
+            st, who, what = status[i["id"]]
+            text = {"claimed": f"claimed by {', '.join(who)}", "superseded": f"superseded: an older build of {what} ({', '.join(who)})",
+                    "near miss": f"near miss: declared is {what}", "undeclared": "undeclared", "dangling": "dangling (no tag)"}[st]
+            print(f"{name(i)} | {size_text(i['size'])} | {text}")
+        built = {r for r, w in wants.items() if "built" in w}
+        for ref in sorted(set(wants) | set(recipes)):
+            w = wants.get(ref, {})
+            if "built" in w or image_parts(ref)[0] in built or any(image_matches(ref, i) for i in images):
+                continue
+            print(f"{ref} | not here | wanted by {', '.join(w.get('from', []) or recipes.get(ref, []))}")
+        df = subprocess.run([DOCKER, "system", "df", "--format", "{{json .}}"], capture_output=True, text=True)
+        for line in df.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("Type") in ("Build Cache", "Local Volumes"):
+                print(f"({row['Type'].lower()}: {row.get('Size', '?')}, never removed by coworker)")
+        print(f"removable (containers remove): {len(removable)} image(s), {size_text(sum(i['size'] for i in removable))}")
+        return 0
+    if not removable:
+        print("nothing to remove: every image here is claimed")
+        return 0
+    yes = "--yes" in args[1:] or os.environ.get("COWORKER_UNATTENDED") == "1"
+    if not yes:
+        for i in removable:
+            print(f"  {name(i)} | {size_text(i['size'])} | {status[i['id']][0]}", file=sys.stderr)
+        raise Waiting(f"containers remove would delete these {len(removable)} image(s), "
+                      f"{size_text(sum(i['size'] for i in removable))}, which no project claims: a human's call: "
+                      f"containers remove --yes")
+    failed = 0
+    for i in removable:
+        r = subprocess.run([DOCKER, "rmi", i["id"]], capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f"removed {name(i)} ({size_text(i['size'])})")
+        else:
+            failed += 1
+            print(f"containers: kept {name(i)}: {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else 'docker rmi failed'}",
+                  file=sys.stderr)
+    return 1 if failed else 0
+
+
+def survey_from(w, network=True, pips=True, tools=True, images=True):
     """[(kind, name, want, state, problem)] where problem is None when all is well."""
     fam = family()
     if not pips:
@@ -525,6 +737,8 @@ def survey_from(w, network=True, pips=True, tools=True):
         how, where = want["probe"]
         found = shutil.which(where) if how == "command" else (user_path(where) if os.path.exists(user_path(where)) else None)
         rows.append(("tool", name, want, found or f"no {where}", None if found else "missing"))
+    if images and w.get("container_images"):
+        rows += image_rows(w["container_images"], local_images())
     if network and w["network"]:
         names = sorted(w["network"])
         with ThreadPoolExecutor(16) as pool:
@@ -619,7 +833,7 @@ def install(args):
         print("deps: install runs as the user (the pips go in the user's site); as root, use --sudo", file=sys.stderr)
         return 2
     if sudo:        # root: the host packages only
-        cmds = host_command(survey(args, network=False, pips=False, tools=False))
+        cmds = host_command(survey(args, network=False, pips=False, tools=False, images=False))
         if not cmds:
             print("# no host packages to install", file=sys.stderr)
             return 0
@@ -627,7 +841,7 @@ def install(args):
             return 1
         if dry:
             return 0
-        left = [r for r in survey(args, network=False, pips=False, tools=False) if r[4]]
+        left = [r for r in survey(args, network=False, pips=False, tools=False, images=False) if r[4]]
         if left:
             print("still to fix after the install:")
             show(left)
@@ -635,7 +849,7 @@ def install(args):
         print("host packages installed")
         return 0
     rows = survey(args, network=False)
-    if not run_all(pip_commands(rows), dry):
+    if not run_all(pip_commands(rows) + pull_commands(rows), dry):
         return 1
     tools = [r for r in rows if r[0] == "tool" and r[4]]
     if dry:     # stdout: only what this run would run; the other halves on stderr
@@ -728,6 +942,8 @@ def status(args):
         print(f"  {name}, from its own installer, in the user's home:\n    {want['how']}")
     if "host" in kinds:
         print(f"  host packages, as root:\n    sudo {me} install --sudo {folder}")
+    if "image" in kinds:
+        print(f"  container images that aren't here (pulling them failed above, or there's no docker):\n    {me} install {folder}")
     if "net" in kinds:
         print(f"  network hosts that don't answer (a firewall's to open):\n    {me} hosts {folder}")
     show(left)
@@ -948,14 +1164,14 @@ def vm_guest(args):
 
 
 def main(argv):
-    if not argv or argv[0] not in ("check", "install", "hosts", "register", "status", "vm-claim", "vm-guest"):
+    if not argv or argv[0] not in ("check", "install", "hosts", "register", "status", "vm-claim", "vm-guest", "containers"):
         print(USAGE, file=sys.stderr)
         return 2
     try:
-        if argv[0] in ("register", "status", "vm-claim"):
+        if argv[0] in ("register", "status", "vm-claim") or argv[:2] == ["containers", "remove"]:
             client()
         return {"check": check, "install": install, "hosts": hosts, "register": register, "status": status,
-                "vm-claim": vm_claim, "vm-guest": vm_guest}[argv[0]](argv[1:])
+                "vm-claim": vm_claim, "vm-guest": vm_guest, "containers": containers}[argv[0]](argv[1:])
     except Bad as e:
         print(f"deps: {e}", file=sys.stderr)
         return e.code

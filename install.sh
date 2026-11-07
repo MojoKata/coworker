@@ -31,7 +31,7 @@ if [ -n "$old" ] && [ "$old" != "$new" ] && [ "$CHANGE" = 0 ]; then
     exit 3
 fi
 mkdir -p "$H/bin" "$H/downloads" "$H/vms" "$H/.coworker"
-for f in downloads vms deps; do
+for f in downloads vms deps containers; do
     install -m 755 "$HERE/libexec/$f" "$H/bin/.$f.new"
     mv -f "$H/bin/.$f.new" "$H/bin/$f"         # a rename: a run of the old copy keeps going
 done

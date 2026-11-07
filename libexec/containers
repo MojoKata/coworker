@@ -1,0 +1,8 @@
+#!/bin/sh
+# containers: the container images the machine's projects declare (their deps.json's
+# "container_images", and the VM recipes'), and the ones no project claims. README.md,
+# "Container images".
+#
+#   containers list               every image here: its size, who claims it, or why it's removable
+#   containers remove [--yes]     delete the images no project claims (a human's call: --yes)
+exec "$(cd "$(dirname "$0")" && pwd)/deps" containers "$@"

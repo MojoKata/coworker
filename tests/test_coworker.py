@@ -45,7 +45,7 @@ class Home(Case):
     def test_install_copies_the_commands_and_keeps_the_data(self):
         out = subprocess.run(["sh", str(ROOT / "install.sh")], capture_output=True, text=True, env=self.env, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
-        for f in ("downloads", "vms", "deps"):
+        for f in ("downloads", "vms", "deps", "containers"):
             p = self.home / "bin" / f
             self.assertTrue(p.is_file() and not p.is_symlink() and os.access(p, os.X_OK), f)
             self.assertEqual(p.read_bytes(), (ROOT / "libexec" / f).read_bytes())
@@ -57,7 +57,7 @@ class Home(Case):
         self.assertEqual((self.home / "bin" / "vms").read_bytes(), (ROOT / "libexec" / "vms").read_bytes())
         self.assertEqual((self.home / "downloads" / "x.iso").read_text(), "data")
         self.assertTrue((self.home / "vms" / "win").is_dir())
-        self.assertEqual(sorted(os.listdir(self.home / "bin")), ["deps", "downloads", "vms"])
+        self.assertEqual(sorted(os.listdir(self.home / "bin")), ["containers", "deps", "downloads", "vms"])
 
     def test_an_unknown_subcommand_shows_the_usage(self):
         for cmd in (DOWNLOADS, VMS):

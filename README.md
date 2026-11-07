@@ -17,6 +17,7 @@ and hands the call to it ([Protocol](#protocol)).
 | `$COWORKER_HOME/bin/downloads` | shares large downloads ([Downloads](#downloads)) |
 | `$COWORKER_HOME/bin/vms` | shares virtual machines ([VMs](#vms)) |
 | `$COWORKER_HOME/bin/deps` | checks what the projects need installed and reachable ([Dependencies](#dependencies)) |
+| `$COWORKER_HOME/bin/containers` | the container images the projects declare, and the ones no project claims ([Container images](#container-images)) |
 | `$COWORKER_HOME/.coworker/deps.json` | coworker's own needs, installed from this checkout's |
 | `$COWORKER_HOME/projects/` | each project `deps` has seen: `<project>` holds its checkout's path |
 | `$COWORKER_HOME/downloads/` | the downloads, with their checksums and claims |
@@ -450,6 +451,50 @@ change to every project's test machine: the machine's owner's call, through a PR
 
 Both reach Microsoft (`deps hosts` lists the hosts): `create` for the ISO, unless
 `downloads/<ISO>` holds it, and `update` for Windows Update.
+
+## Container images
+
+A project declares the container images it uses in its `deps.json` (protocol 4.2); declaring is
+claiming, so nothing else records who needs an image:
+
+```json
+"container_images": [
+  { "image": "ubuntu:22.04@sha256:b8b6ee6a…", "why": "builds the AppImage (glibc 2.35)" },
+  { "image": "myproject-tier1", "built": "scripts/test-tier1.sh", "from": ["ubuntu:24.04@sha256:00817…"],
+    "why": "tier 1: the release's Python on Ubuntu 24.04" }
+]
+```
+
+| Key | What it is |
+|---|---|
+| `image` | an image a project pulls, by its tag and, best, its digest (a bare name is refused: it means whatever `:latest` is); or, with `built`, the repository of one a project builds, without a tag (its tag changes as its recipe does) |
+| `built` | the script that builds it |
+| `from` | the images it's built from, each by tag or digest: claimed too |
+| `platform`, `why` | as for the other lists |
+
+`"containers"` is kept for long-lived named containers, should a project have one; the containers
+a project runs and removes (`docker run --rm`) aren't declared. A VM's own image is its recipe's
+(`IMAGE` in `recipe.env`), claimed by the VM.
+
+- **`deps check`** lists each declared image and whether it's here. One that isn't is no problem:
+  docker pulls a pulled image when a script first runs it, and a built one's script builds it
+  (a built image named as another's base is that one, never pulled). Only no docker is a problem.
+  `deps install` pulls the missing ones ahead, say before going offline. `coworker status` doesn't:
+  CI runs it in every job, and pulling every declared image there would cost gigabytes each time.
+
+      containers list
+      containers remove [--yes]
+
+- **`list`** reads the declarations of every project the machine has seen, coworker's own and the
+  VM recipes', and shows each image here with its size and who claims it, or why no one does:
+  *superseded* (an older build of a built image: the newest counts), *near miss* (the repository of
+  a declared image, at another tag or digest: a pin that moved on), *undeclared*, or *dangling* (no
+  tag). Then the declared images that aren't here, the build cache and volumes, and what
+  `remove` would free.
+- **`remove`** deletes the images no project claims (superseded, near misses, undeclared,
+  dangling), never a claimed one, never the build cache or volumes. It's a human's call: without
+  `--yes` it lists them and exits 3 (`COWORKER_UNATTENDED=1` counts as yes). An image a container
+  still uses is kept and said.
 
 ## Tests
 

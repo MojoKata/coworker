@@ -9,7 +9,7 @@
 #   coworker install [--change]     install this coworker into $COWORKER_HOME (a human's call, or
 #                                   their say-so); --change when the installed one's protocol differs
 #   coworker protocol               this coworker's protocol
-#   coworker deps|vms|downloads ... the installed command, after the handshake (as bin/deps ... is)
+#   coworker deps|vms|downloads|containers ... the installed command, after the handshake (as bin/deps ... is)
 #
 # Exit 3: waiting on a human (not installed, or a protocol that doesn't match), with what to run.
 # COWORKER_UNATTENDED=1 (CI, where there's no human) installs instead of waiting.
@@ -84,11 +84,11 @@ case $cmd in
         handshake status
         export COWORKER_HOME="$H" COWORKER_CLIENT_PROTOCOL="$MINE"
         exec "$H/bin/deps" status $flags "$d" ;;
-    deps|vms|downloads)
+    deps|vms|downloads|containers)
         handshake "$cmd" "${1:-}"
         export COWORKER_HOME="$H" COWORKER_CLIENT_PROTOCOL="$MINE"
         exec "$H/bin/$cmd" "$@" ;;
     *)
-        echo "usage: coworker status [--no-network] [DIR] | install [--change] | protocol | deps|vms|downloads ARG..." >&2
+        echo "usage: coworker status [--no-network] [DIR] | install [--change] | protocol | deps|vms|downloads|containers ARG..." >&2
         exit 2 ;;
 esac
