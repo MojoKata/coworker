@@ -312,7 +312,8 @@ A project's `deps.json` says, under `"vms"`, what it needs of each shared VM it 
 
 `vms run` writes the project's entry into its claim (`<vm>.<project>`, beside the VM's folder), so
 the merge sees every project that uses the VM without knowing where their checkouts are. Merging:
-the same `family`, `name` and `version` (else a clash), the highest `min` and the lowest `max` of
+the same `family` and `version` (else a clash), names one inside the other (`Windows 10` and
+`Windows 10 Pro`: the longer counts), the highest `min` and the lowest `max` of
 the build, one `pin`; the host needs as at the top level.
 
 ## Tests

@@ -619,6 +619,10 @@ def merge_os(vm, claims):
             continue
         if out is None:
             out = {"from": [], "why": []}
+        if "name" in o and "name" in out:       # both must be in the guest's name: one inside the other
+            a, b = out["name"], o["name"]
+            if a.lower() in b.lower() or b.lower() in a.lower():
+                o = {**o, "name": max(a, b, key=len)}
         for k in ("family", "name", "version"):
             if k in o:
                 if k in out and out[k] != o[k]:

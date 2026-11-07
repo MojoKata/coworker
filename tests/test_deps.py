@@ -474,6 +474,12 @@ class VmsRun(Case):
         self.assertFalse((self.tmp / "ran").exists())
         self.assertEqual(self.log(), ["docker start box", "docker stop box"])     # only the first run's
 
+    def test_a_name_inside_anothers_is_no_clash_and_the_longer_counts(self):
+        self.run_vm(self.project("one", {"project": "one", "vms": {"win": {"os": WIN}}}), "true", rc=0)
+        older = {"family": "windows", "name": "Windows 10", "min": "10.0.17763", "why": "two runs on 1809+"}
+        res = self.run_vm(self.project("two", {"project": "two", "vms": {"win": {"os": older}}}), "true", rc=0)
+        self.assertIn("Windows 10 Pro 22H2 build >= 10.0.19045  [one, two]", res.stdout)
+
     def test_builds_combine_across_projects_and_a_guest_below_them_is_refused(self):
         self.project("one", {"project": "one", "vms": {"win": {"os": WIN}}})
         self.run_vm(self.tmp / "one", "true", rc=0)
