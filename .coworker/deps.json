@@ -1,0 +1,21 @@
+{
+  "host": [
+    { "package": "util-linux", "why": "flock: the VM lock and the download lock" },
+    { "package": "curl", "why": "downloads fetch" },
+    { "package": "python3", "min": "3.9", "why": "deps runs on it" },
+    { "package": "openssh-clients", "platform": "rocky*", "why": "ssh and scp to the shared VMs" },
+    { "package": "openssh-client", "platform": "debian*", "why": "ssh and scp to the shared VMs" },
+    { "package": "openssh-client", "platform": "ubuntu*", "why": "ssh and scp to the shared VMs" }
+  ],
+  "network": [
+    { "host": "github.com", "why": "this repository, and the projects' own" },
+    { "host": "dl.rockylinux.org", "platform": "rocky*", "why": "dnf: Rocky's main server, when the mirrors it is handed don't answer" },
+    { "host": "mirrors.rockylinux.org", "platform": "rocky*", "why": "dnf: the list of mirrors" },
+    { "host": "download.docker.com", "why": "Docker's own package repository" },
+    { "host": "registry-1.docker.io", "why": "Docker Hub: images (curlimages/curl for downloads fetch, the VMs' images)" },
+    { "host": "auth.docker.io", "why": "Docker Hub: sign-in tokens for pulls" },
+    { "host": "production.cloudflare.docker.com", "why": "Docker Hub: image layers" },
+    { "host": "pypi.org", "why": "pip install --user of the pips a deps.json names" },
+    { "host": "files.pythonhosted.org", "why": "pip: the packages themselves" }
+  ]
+}

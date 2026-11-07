@@ -1,7 +1,8 @@
 # coworker
 
 How projects that share one development machine share its big, slow-to-make things (installer
-ISOs and other large downloads, virtual machines) without stepping on each other. The shared thing
+ISOs and other large downloads, virtual machines) without stepping on each other, and say what the
+machine must have installed and reachable for them. The shared thing
 records who uses it, so no project's documents need to name another.
 
 This repository is the source. The commands are **installed** from it into the machine's coworker
@@ -13,6 +14,8 @@ home, which also holds the shared things; the checkout itself never holds them.
 | `$COWORKER_HOME` (`~/coworker` unless set) | the installed commands and the shared things |
 | `$COWORKER_HOME/bin/downloads` | shares large downloads ([Downloads](#downloads)) |
 | `$COWORKER_HOME/bin/vms` | shares virtual machines ([VMs](#vms)) |
+| `$COWORKER_HOME/bin/deps` | checks what the projects need installed and reachable ([Dependencies](#dependencies)) |
+| `$COWORKER_HOME/.coworker/deps.json` | coworker's own needs, installed from this checkout's |
 | `$COWORKER_HOME/downloads/` | the downloads, with their checksums and claims |
 | `$COWORKER_HOME/vms/` | the VMs' folders, with their claims and locks |
 | `$COWORKER_HOME/VERSION` | what's installed (`git describe` of the checkout it came from) |
@@ -24,11 +27,11 @@ they run installed or from a checkout.
 
     git clone https://github.com/MojoKata/coworker.git && coworker/install.sh
 
-`install.sh` copies `bin/downloads` and `bin/vms` into `$COWORKER_HOME/bin` (copies, not links),
-writes `VERSION`, and creates `downloads/` and `vms/` if they're missing. It never touches what's in
+`install.sh` copies `bin/downloads`, `bin/vms` and `bin/deps` into `$COWORKER_HOME/bin` (copies, not
+links) and `.coworker/deps.json` into `$COWORKER_HOME/.coworker/`, writes `VERSION`, and creates `downloads/` and `vms/` if they're missing. It never touches what's in
 them, so updating is `git pull` and `install.sh` again. Versions are this repository's tags.
 (Versions 1 and 2 of the protocol lived as a `coworker/` folder copied into each project; version 2
-made a run that starts a VM stop it.)
+made a run that starts a VM stop it; version 3 added `deps` and a project's `.coworker/deps.json`.)
 
 ## In a project
 
@@ -39,6 +42,8 @@ made a run that starts a VM stop it.)
       CW=${COWORKER_HOME:-$HOME/coworker}
       [ -x "$CW/bin/vms" ] || { echo "coworker isn't installed: run install.sh from a checkout of MojoKata/coworker" >&2; exit 1; }
 
+- **What it needs of the machine.** `.coworker/deps.json` in the project's checkout, version-controlled
+  with the project ([Dependencies](#dependencies)).
 - **Where it's written down.** The project's own documents say what it claims and why. Nothing here
   names a project.
 
@@ -181,9 +186,77 @@ Maintenance:
 - **Adding a VM:** its folder in `vms/`, with `README.md` and `vm.env` (and, if a container runs
   it, the container named `coworker-<vm>`); then each project that needs it claims it.
 
+## Dependencies
+
+Each project says in its own `.coworker/deps.json` what the machine must have for it: host packages,
+pips in the system Python, and network hosts it reaches. `deps` reads those files, and coworker's
+own, and says what's missing, prints the commands that install it, and lists the hosts for the
+machine's firewall. It never installs anything itself: host packages need `sudo`, which is the
+machine owner's.
+
+    deps check   [--no-network] [DIR...]
+    deps install [DIR...]
+    deps hosts   [DIR...]
+
+- **`check`** lists every need with what's installed and whether it's met, and whether each host
+  answers. Exit 1 if anything is missing, out of range or unreachable; 2 if a `deps.json` is wrong or
+  two projects' needs clash.
+- **`install`** prints the commands: one `sudo dnf install` (or `sudo apt-get install`) and one
+  `pip install --user` (after `ensurepip --user` when the Python has no pip). It runs nothing.
+- **`hosts`** lists every network host the projects need, whether it answers, and why it's needed:
+  what to open on a firewall.
+
+A `DIR` is a project's checkout. Coworker's own `deps.json` (installed with the commands) always
+counts too.
+
+### `.coworker/deps.json`
+
+```json
+{
+  "project": "myproject",
+  "host": [
+    { "package": "libglvnd-glx", "platform": "rocky-10*", "min": "1.7.0", "why": "Qt's libGL, for the tests" },
+    { "package": "libgl1", "platform": "ubuntu*", "why": "Qt's libGL, for the tests" }
+  ],
+  "pips": [
+    { "pip": "pillow", "min": "13.0.0", "why": "screenshots: its PNGs measured the best size and quality" }
+  ],
+  "network": [
+    { "host": "github.com", "why": "the project's releases" },
+    { "host": "internal.example", "port": 22, "tls": false, "why": "an SSH service" }
+  ]
+}
+```
+
+| Key | What it is |
+|---|---|
+| `project` | the project's name (as it claims things); labels its needs in the output |
+| `host` | host packages: `package` is the distribution's name for it (`dnf`/`apt`) |
+| `pips` | pips in the system Python (`python3`): `pip` is the distribution name (`pillow`, not `PIL`) |
+| `network` | hosts it reaches: `host`, `port` (443), `tls` (true: a TLS handshake naming the host must finish) |
+| `platform` | which machines an entry is for: a glob over `ID-VERSION_ID` from `/etc/os-release` (`rocky-10.2`, `ubuntu-24.04`); every machine if left out |
+| `min`, `max` | the versions it accepts, inclusive; `pin`, exactly one (not with `min` or `max`) |
+| `why` | required: what needs it, so nobody has to rediscover the reason |
+
+Rules:
+
+- **First match.** In a file, the first entry whose `platform` matches the machine wins for its
+  name; later entries with that name are not read. A name with no matching entry isn't needed there.
+  So a list can go from the most specific platform to `*`.
+- **Projects combine.** The same name in two projects needs both: the highest `min`, the lowest `max`.
+  Two different pins, or a `min` above a `max`, is a clash: `deps` reports which projects and stops
+  (exit 2). The agent working at the time sorts it out with the machine's owner.
+- **Versions** compare as the package manager does (rpm's or dpkg's rules), without the packaging
+  revision (`2.15.0-7.el10` meets a pin of `2.15.0`); pips by their release numbers.
+- **A host answers** when a TLS handshake that names it finishes. A firewall that filters by the
+  TLS server name lets the connection open and then never answers, so a connection alone proves
+  nothing. A service that isn't TLS says `"tls": false`.
+- **No `sudo` here.** `deps install` prints what to run; the machine's owner runs the `sudo` part.
+
 ## Tests
 
     python3 -m unittest discover -s tests
 
-Standard library only; they need `sh`, `flock` (util-linux) and, for `fetch`, `curl`. Each test
+Standard library only; they need `sh`, `flock` (util-linux), for `fetch`, `curl`, and for the
+network checks, `openssl` (a throwaway certificate). Each test
 uses a throwaway `COWORKER_HOME`, so they never touch the machine's.
