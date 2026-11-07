@@ -1,0 +1,24 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v
+      - name: install.sh into a throwaway home
+        run: |
+          COWORKER_HOME="$RUNNER_TEMP/coworker" ./install.sh
+          "$RUNNER_TEMP/coworker/bin/downloads" list
+          "$RUNNER_TEMP/coworker/bin/vms" list
+          "$RUNNER_TEMP/coworker/bin/deps" install
