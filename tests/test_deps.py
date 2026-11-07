@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEPS = str(ROOT / "bin" / "deps")
+DEPS = str(ROOT / "libexec" / "deps")
 
 RPM = """#!/bin/sh
 # rpm -q --qf FORMAT NAME, answered from FAKE_RPMS ("name=version-release ...") and the file FAKE_RPMDB
@@ -68,7 +68,8 @@ class Case(unittest.TestCase):
                     "COWORKER_FAMILY": "rpm", "COWORKER_PYTHON": str(stubs / "python"),
                     "PATH": f"{stubs}:{os.environ['PATH']}", "FAKE_RPMS": "", "FAKE_PIPS": "", "FAKE_HAS_PIP": "1",
                     "FAKE_LOG": str(self.tmp / "log"), "FAKE_RPMDB": str(self.tmp / "rpmdb"),
-                    "FAKE_PIPDB": str(self.tmp / "pipdb"), "COWORKER_EUID": "1000"}
+                    "FAKE_PIPDB": str(self.tmp / "pipdb"), "COWORKER_EUID": "1000",
+                    "COWORKER_CLIENT_PROTOCOL": (ROOT / "PROTOCOL").read_text().strip()}
 
     def project(self, name, deps, folder=None):
         d = self.tmp / (folder or name)
@@ -508,7 +509,7 @@ class InstallScript(Case):
         self.assertEqual(res.returncode, 0, res.stderr)
         p = self.home / "bin" / "deps"
         self.assertTrue(p.is_file() and os.access(p, os.X_OK))
-        self.assertEqual(p.read_bytes(), (ROOT / "bin" / "deps").read_bytes())
+        self.assertEqual(p.read_bytes(), (ROOT / "libexec" / "deps").read_bytes())
         self.assertEqual((self.home / ".coworker" / "deps.json").read_bytes(),
                          (ROOT / ".coworker" / "deps.json").read_bytes())
 
@@ -534,7 +535,7 @@ case $last in
   *) cat > /dev/null; printf '%s\\r\\n' "$FAKE_GUEST" ;;
 esac
 """
-VMS = str(ROOT / "bin" / "vms")
+VMS = str(ROOT / "libexec" / "vms")
 WIN = {"family": "windows", "name": "Windows 10 Pro", "version": "22H2", "min": "10.0.19045", "why": "Setup's MinVersion"}
 
 

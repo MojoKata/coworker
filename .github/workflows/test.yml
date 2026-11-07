@@ -16,9 +16,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Tests
         run: python3 -m unittest discover -s tests -v
-      - name: install.sh into a throwaway home
+      - name: the launcher, unattended as a client's CI runs it, into a throwaway home
+        env:
+          COWORKER_HOME: ${{ runner.temp }}/coworker
+          COWORKER_UNATTENDED: "1"
         run: |
-          COWORKER_HOME="$RUNNER_TEMP/coworker" ./install.sh
-          "$RUNNER_TEMP/coworker/bin/downloads" list
-          "$RUNNER_TEMP/coworker/bin/vms" list
-          "$RUNNER_TEMP/coworker/bin/deps" install
+          bin/downloads list
+          cat "$COWORKER_HOME/PROTOCOL"
+          bin/vms list
+          "$COWORKER_HOME/bin/deps" install

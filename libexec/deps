@@ -1,0 +1,941 @@
+#!/usr/bin/env python3
+"""deps: what the machine needs installed and reachable for its projects and shared VMs, from each
+one's .coworker/deps.json. README.md, "Dependencies".
+
+  deps check   [--no-network] [DIR...]  what's missing, out of range or unreachable (exit 1 if any)
+  deps install [--dry-run] [DIR...]     as the user (never root): installs the missing pips (--user),
+                                        then says which host packages are left for the --sudo run
+  sudo deps install --sudo [--dry-run] [DIR...]  as root only: installs the missing host packages
+                                        --dry-run (-n): print the commands it would run, run nothing
+  deps hosts   [DIR...]                 every network host needed, and whether it answers
+  deps register DIR                     remember the project; one line if the host lacks any of its
+                                        needs; exit 0 (2 only for a broken deps.json)
+  deps status  [--no-network] DIR       for coworker status: register DIR and do what needs no human; then
+                                        what's waiting on one (exit 3), or with COWORKER_UNATTENDED=1
+                                        do that too (exit 1 if something still can't be done)
+  deps vm-claim VM DIR                  for vms run: claim VM with DIR's needs of it, merge every
+                                        claimant's, check the host side (exit 1 missing, 65 clash)
+  deps vm-guest VM [--wait SECONDS]     for vms run: the running guest meets the merged needs (69 not)
+
+register, status and vm-claim come through a project's coworker submodule (COWORKER_CLIENT_PROTOCOL;
+exit 3 without it or for a protocol this install doesn't serve). A DIR is a project's checkout,
+holding .coworker/deps.json. The coworker home's own deps.json
+(installed by install.sh) always counts too. Each DIR is remembered in $COWORKER_HOME/projects/
+(<project> holds its path), so with no DIR every project the machine has seen counts.
+Standard library only. COWORKER_PYTHON names the Python whose pips count (python3); COWORKER_PLATFORM,
+COWORKER_FAMILY, COWORKER_TLS_CA and COWORKER_NET_TIMEOUT stand in for the machine's in tests.
+"""
+
+import fnmatch
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+def euid():
+    return int(os.environ.get("COWORKER_EUID", os.geteuid()))
+
+
+def coworker_home():
+    """$COWORKER_HOME; else the home this copy is installed in (<home>/bin/deps beside <home>/VERSION),
+    so root sees the user's projects whether it came by sudo or a root login; else, run from a
+    checkout, under sudo (which resets HOME and drops COWORKER_HOME) the invoking user's ~/coworker,
+    and otherwise ~/coworker."""
+    if os.environ.get("COWORKER_HOME"):
+        return os.environ["COWORKER_HOME"]
+    here = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if os.path.basename(os.path.dirname(os.path.realpath(__file__))) == "bin" and \
+            os.path.isfile(os.path.join(here, "VERSION")):
+        return here
+    if euid() == 0 and os.environ.get("SUDO_USER"):
+        import pwd
+        return os.path.join(pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir, "coworker")
+    return os.path.join(os.path.expanduser("~"), "coworker")
+
+
+HOME = coworker_home()
+PYTHON = os.environ.get("COWORKER_PYTHON", "python3")
+USAGE = ("usage: deps check [--no-network] [DIR...] | install [--dry-run] [DIR...] | install --sudo [--dry-run] [DIR...] (as root)"
+         " | hosts [DIR...] | register DIR | status [--no-network] DIR | vm-claim VM DIR | vm-guest VM [--wait SECONDS]")
+PROTOCOL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "PROTOCOL")
+SSH = os.environ.get("COWORKER_SSH", "ssh")
+SUDO_HINT = f"sudo {os.path.join(HOME, 'bin', 'deps')} install --sudo (or that, as root)"
+KEYS = {"host": "package", "pips": "pip", "network": "host", "tools": "tool"}
+ENTRY_KEYS = {"platform", "min", "max", "pin", "why", "port", "probe", "command", "path", "how"}
+
+
+class Bad(Exception):
+    code = 2            # a deps.json that's wrong, or a wrong call
+
+
+class Clash(Bad):
+    code = 65           # two projects' needs that can't both hold
+
+
+class Unmet(Bad):
+    code = 69           # a shared VM that doesn't meet what its projects need
+
+
+class Waiting(Bad):
+    code = 3            # waiting on a human: the protocol, or something only they may do
+
+
+def protocol():
+    try:
+        with open(PROTOCOL_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return "?"
+
+
+def client():
+    """The installed half of the handshake: a call that changes shared state comes through a project's
+    coworker submodule, which passes its protocol; this install serves the same major, up to its minor."""
+    mine, theirs = protocol(), os.environ.get("COWORKER_CLIENT_PROTOCOL", "")
+    if not theirs:
+        raise Waiting(f"called directly, not through a project's coworker submodule: a project calls "
+                      f"<its checkout>/coworker/bin/deps (coworker {mine}; README.md, \"In a project\")")
+    try:
+        (cm, cn), (im, inn) = (tuple(int(x) for x in v.split(".")) for v in (theirs, mine))
+    except ValueError:
+        raise Waiting(f"can't read the protocols (this project's {theirs!r}, installed {mine!r})")
+    if cm != im or inn < cn:
+        raise Waiting(f"this project's coworker is protocol {theirs} and the installed one is {mine}: "
+                      f"the machine's owner moves them together (README.md, \"Protocol\")")
+
+
+# -- where the machine stands -------------------------------------------------------------------
+
+def os_release():
+    info = {}
+    for path in ("/etc/os-release", "/usr/lib/os-release"):
+        if os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    k, _, v = line.strip().partition("=")
+                    if k:
+                        info[k] = v.strip('"')
+            break
+    return info
+
+
+def platform():
+    """ID-VERSION_ID from os-release, e.g. rocky-10.2 or ubuntu-24.04."""
+    if os.environ.get("COWORKER_PLATFORM"):
+        return os.environ["COWORKER_PLATFORM"]
+    info = os_release()
+    return f"{info.get('ID', 'unknown')}-{info.get('VERSION_ID', '')}".rstrip("-")
+
+
+def family():
+    """rpm or deb: how host packages are installed and asked about."""
+    if os.environ.get("COWORKER_FAMILY"):
+        return os.environ["COWORKER_FAMILY"]
+    info = os_release()
+    ids = {info.get("ID", "")} | set(info.get("ID_LIKE", "").split())
+    if ids & {"rhel", "fedora", "centos", "rocky", "almalinux", "suse", "opensuse"} or shutil.which("rpm") and not shutil.which("dpkg-query"):
+        return "rpm"
+    return "deb"
+
+
+# -- versions -----------------------------------------------------------------------------------
+
+def rpmvercmp(a, b):
+    """rpm's version comparison: alternating digit and letter runs, ~ sorts before anything."""
+    if a == b:
+        return 0
+    seg = re.compile(r"~|\^|\d+|[A-Za-z]+")
+    x, y = seg.findall(a), seg.findall(b)
+    while x or y:
+        p, q = (x.pop(0) if x else None), (y.pop(0) if y else None)
+        if p == "~" or q == "~":
+            if p != q:
+                return -1 if p == "~" else 1
+            continue
+        if p is None or q is None:
+            return -1 if p is None else 1
+        if p.isdigit() != q.isdigit():
+            return 1 if p.isdigit() else -1
+        if p.isdigit():
+            p, q = int(p), int(q)
+        if p != q:
+            return 1 if p > q else -1
+    return 0
+
+
+def debvercmp(a, b):
+    r = subprocess.run(["dpkg", "--compare-versions", a, "lt", b])
+    if r.returncode == 0:
+        return -1
+    return 0 if subprocess.run(["dpkg", "--compare-versions", a, "eq", b]).returncode == 0 else 1
+
+
+def pipvercmp(a, b):
+    """The release numbers of two PEP 440 versions (1.2.3rc1 -> 1.2.3), compared."""
+    def nums(v):
+        m = re.match(r"(\d+(?:\.\d+)*)", v.split("!")[-1])
+        t = [int(n) for n in m.group(1).split(".")] if m else [0]
+        while t and t[-1] == 0:
+            t.pop()
+        return t
+    p, q = nums(a), nums(b)
+    return (p > q) - (p < q)
+
+
+def upstream(v):
+    """A package version without epoch and packaging revision: 1:2.15.0-7.el10 -> 2.15.0."""
+    return v.split(":", 1)[-1].rsplit("-", 1)[0]
+
+
+def in_range(have, want, cmp):
+    """None if `have` meets want's min/max/pin, else what it misses."""
+    if "pin" in want and cmp(upstream(have), want["pin"]) != 0 and cmp(have, want["pin"]) != 0:
+        return f"pinned to {want['pin']}"
+    if "min" in want and cmp(upstream(have), want["min"]) < 0:
+        return f"below {want['min']}"
+    if "max" in want and cmp(upstream(have), want["max"]) > 0:
+        return f"above {want['max']}"
+    return None
+
+
+def spec_text(want):
+    if "pin" in want:
+        return f"=={want['pin']}"
+    return ",".join(s for s in (f">={want['min']}" if "min" in want else "",
+                                f"<={want['max']}" if "max" in want else "") if s)
+
+
+# -- what is installed --------------------------------------------------------------------------
+
+def installed_host(name, fam):
+    if fam == "rpm":
+        r = subprocess.run(["rpm", "-q", "--qf", "%{VERSION}-%{RELEASE}\\n", name], capture_output=True, text=True)
+        return r.stdout.split("\n")[0].strip() if r.returncode == 0 else None
+    r = subprocess.run(["dpkg-query", "-W", "-f", "${db:Status-Status} ${Version}", name], capture_output=True, text=True)
+    status, _, version = r.stdout.partition(" ")
+    return version.strip() if r.returncode == 0 and status == "installed" else None
+
+
+def installed_pip(name):
+    code = "import importlib.metadata as m, sys\ntry: print(m.version(sys.argv[1]))\nexcept m.PackageNotFoundError: sys.exit(3)"
+    try:
+        r = subprocess.run([PYTHON, "-c", code, name], capture_output=True, text=True, timeout=30)
+    except OSError:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def has_pip():
+    try:
+        return subprocess.run([PYTHON, "-m", "pip", "--version"], capture_output=True, timeout=30).returncode == 0
+    except OSError:
+        return False
+
+
+def default_probe(port):
+    return "http" if port == 80 else "tls"
+
+
+def answers(host, port, probe="tls", timeout=float(os.environ.get("COWORKER_NET_TIMEOUT", "5"))):
+    """(True, ms) if host:port answers as `probe` says, else (False, why). A firewall that filters
+    by name lets the connection open and then never answers, so each probe goes as far as the real
+    client does: tls finishes a handshake naming the host, http gets a status line back for a
+    request naming it, tcp only connects."""
+    t, stage = time.monotonic(), "connecting"
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            if probe == "tls":
+                stage = "the TLS handshake"
+                ctx = ssl.create_default_context()
+                if os.environ.get("COWORKER_TLS_CA"):
+                    ctx.load_verify_locations(os.environ["COWORKER_TLS_CA"])
+                with ctx.wrap_socket(s, server_hostname=host):
+                    pass
+            elif probe == "http":
+                stage = "an HTTP request"
+                s.sendall(f"HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+                if not s.recv(5).startswith(b"HTTP"):
+                    return False, "not an HTTP answer"
+            return True, f"{(time.monotonic() - t) * 1000:.0f} ms"
+    except socket.gaierror:
+        return False, "no such host (DNS)"
+    except ssl.SSLCertVerificationError as e:
+        return False, f"TLS certificate: {e.verify_message}"
+    except (socket.timeout, TimeoutError):
+        return False, f"no answer to {stage} in {timeout:.0f} s (a firewall?)"
+    except ssl.SSLError as e:
+        return False, f"TLS: {e.reason or e}"
+    except OSError as e:
+        return False, e.strerror or str(e)
+
+
+# -- reading deps.json --------------------------------------------------------------------------
+
+OS_FAMILIES = ("windows", "linux")
+
+
+def check_lists(data, path):
+    """Each host/pips/network entry in data (a deps.json, or one VM's section of it) well formed."""
+    for kind, name_key in KEYS.items():
+        entries = data.get(kind, [])
+        if not isinstance(entries, list):
+            raise Bad(f"{path}: {kind} is a list of entries")
+        for i, e in enumerate(entries):
+            where = f"{path}: {kind}[{i}]"
+            if not isinstance(e, dict) or not isinstance(e.get(name_key), str) or not e[name_key]:
+                raise Bad(f"{where}: needs {name_key!r}")
+            extra = set(e) - ENTRY_KEYS - {name_key}
+            if extra:
+                raise Bad(f"{where}: unknown key {sorted(extra)[0]!r}")
+            if not isinstance(e.get("why"), str) or not e["why"].strip():
+                raise Bad(f"{where} ({e[name_key]}): needs a 'why'")
+            if "pin" in e and ("min" in e or "max" in e):
+                raise Bad(f"{where} ({e[name_key]}): a pin with a min or max")
+            if kind == "network" and set(e) & {"min", "max", "pin"}:
+                raise Bad(f"{where} ({e[name_key]}): a host has no version")
+            if kind == "tools":
+                if set(e) & {"min", "max", "pin", "port", "probe"}:
+                    raise Bad(f"{where} ({e[name_key]}): a tool is checked by its command or path only")
+                if ("command" in e) == ("path" in e):
+                    raise Bad(f"{where} ({e[name_key]}): a tool needs a command or a path (one)")
+                if not isinstance(e.get("how"), str) or not e["how"].strip():
+                    raise Bad(f"{where} ({e[name_key]}): a tool needs 'how': how to install it")
+            elif set(e) & {"command", "path", "how"}:
+                raise Bad(f"{where} ({e[name_key]}): command, path and how are a tool's")
+            if kind not in ("network", "tools") and set(e) & {"port", "probe"}:
+                raise Bad(f"{where} ({e[name_key]}): only a network host has a port or probe")
+            if e.get("probe", "tls") not in ("tls", "http", "tcp"):
+                raise Bad(f"{where} ({e[name_key]}): probe is tls, http or tcp")
+
+
+def check_vm(section, where):
+    """One VM's needs: what its guest must be ("os"), and what the host needs to use it."""
+    if not isinstance(section, dict):
+        raise Bad(f"{where}: a VM's needs are an object")
+    for k in section:
+        if k not in KEYS and k != "os":
+            raise Bad(f"{where}: unknown key {k!r} (os, host, pips, network, tools)")
+    check_lists(section, where)
+    o = section.get("os")
+    if o is None:
+        return
+    if not isinstance(o, dict):
+        raise Bad(f"{where}: os is an object")
+    extra = set(o) - {"family", "name", "version", "min", "max", "pin", "why"}
+    if extra:
+        raise Bad(f"{where}: os: unknown key {sorted(extra)[0]!r}")
+    if o.get("family") not in OS_FAMILIES:
+        raise Bad(f"{where}: os needs a family: {' or '.join(OS_FAMILIES)}")
+    if not isinstance(o.get("why"), str) or not o["why"].strip():
+        raise Bad(f"{where}: os needs a 'why'")
+    if "pin" in o and ("min" in o or "max" in o):
+        raise Bad(f"{where}: os: a pin with a min or max")
+
+
+def project_name(folder):
+    """A project's name is its checkout directory's name: what it claims under and registers as."""
+    name = os.path.basename(os.path.realpath(folder))      # through a symlink too: the real directory
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name == "lock":
+        raise Bad(f"{folder}: a project's name is its checkout directory's name, which must be letters, "
+                  f"digits, - and _ (and not lock)")
+    return name
+
+
+def load(folder):
+    path = os.path.join(folder, ".coworker", "deps.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise Bad(f"{folder}: no .coworker/deps.json")
+    except json.JSONDecodeError as e:
+        raise Bad(f"{path}: not JSON: {e}")
+    if not isinstance(data, dict):
+        raise Bad(f"{path}: not a JSON object")
+    for k in data:
+        if k not in KEYS and k not in ("project", "vms"):
+            raise Bad(f"{path}: unknown key {k!r} (project, host, pips, network, tools, vms)")
+    if "project" in data and data["project"] != project_name(folder):
+        raise Bad(f"{path}: \"project\" is {data['project']!r}, but a project's name is its checkout "
+                  f"directory's, {project_name(folder)!r}: drop the key (or rename the directory)")
+    check_lists(data, path)
+    vms = data.get("vms", {})
+    if not isinstance(vms, dict):
+        raise Bad(f"{path}: vms maps each VM's name to what the project needs of it")
+    for vm, section in vms.items():
+        check_vm(section, f"{path}: vms.{vm}")
+    return data
+
+
+def remember(folder, project):
+    """Record a project's checkout in $COWORKER_HOME/projects/<project>, so a run with no DIR finds it."""
+    d = os.path.join(HOME, "projects")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, project)
+    try:
+        with open(path) as f:
+            if f.read().strip() == folder:
+                return
+    except FileNotFoundError:
+        pass
+    with open(path + ".new", "w") as f:
+        f.write(folder + "\n")
+    os.replace(path + ".new", path)
+
+
+def remembered():
+    """The checkouts in $COWORKER_HOME/projects/ that still hold a deps.json (others: said on stderr)."""
+    d = os.path.join(HOME, "projects")
+    out = []
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if name.endswith(".new"):
+            continue
+        with open(os.path.join(d, name)) as f:
+            folder = f.read().strip()
+        if os.path.exists(os.path.join(folder, ".coworker", "deps.json")):
+            out.append(folder)
+        else:
+            print(f"deps: {name}: {folder} has no .coworker/deps.json now; skipped (remove "
+                  f"{os.path.join(d, name)} if the project is gone)", file=sys.stderr)
+    return out
+
+
+def folders(args):
+    """(folder, label) to read, each once: the coworker home's own, then the DIRs (or, with none,
+    every remembered project)."""
+    candidates = [(HOME, "coworker")] if os.path.exists(os.path.join(HOME, ".coworker", "deps.json")) else []
+    candidates += [(d, None) for d in (args or remembered())]
+    out, seen = [], set()
+    for f, label in candidates:
+        f = os.path.realpath(f)
+        if f not in seen:
+            seen.add(f)
+            if label is None:
+                load(f)
+                label = project_name(f)
+            if f != os.path.abspath(HOME) and euid() != 0:      # root writes nothing in the user's home
+                remember(f, label)
+            out.append((f, label))
+    return out
+
+
+def wanted(args):
+    return wanted_from([(label, load(folder)) for folder, label in folders(args)])
+
+
+def wanted_from(sources):
+    """{kind: {name: want}} for this platform from [(label, data)]: in each source the first entry
+    whose platform matches wins for its name; across sources the ranges are combined, and two
+    that can't both hold are a Clash."""
+    plat = platform()
+    out = {k: {} for k in KEYS}
+    for label, data in sources:
+        for kind, name_key in KEYS.items():
+            taken = set()
+            for e in data.get(kind, []):
+                name = e[name_key] if kind != "network" else f"{e['host']}:{e.get('port', 443)}"
+                if name in taken or not fnmatch.fnmatchcase(plat, e.get("platform", "*")):
+                    continue
+                taken.add(name)
+                w = out[kind].setdefault(name, {"from": [], "why": []})
+                if kind == "tools":
+                    probe = ("command", e["command"]) if "command" in e else ("path", e["path"])
+                    if w.setdefault("probe", probe) != probe:
+                        raise Clash(f"{name}: found as {w['probe'][1]} and as {probe[1]} ({', '.join(w['from'])})")
+                    w.setdefault("how", e["how"])
+                if kind == "network":
+                    probe = e.get("probe", default_probe(e.get("port", 443)))
+                    if w.setdefault("probe", probe) != probe:
+                        raise Clash(f"{name}: probed as {w['probe']} and as {probe} ({', '.join(w['from'])})")
+                w["from"].append(label)
+                w["why"].append(e["why"])
+                for bound in ("min", "max", "pin"):
+                    if bound not in e:
+                        continue
+                    if bound not in w or w[bound] == e[bound]:
+                        w[bound] = e[bound]
+                    elif bound == "pin":
+                        raise Clash(f"{name}: pinned to {w['pin']} and to {e['pin']} ({', '.join(w['from'])})")
+                    else:
+                        cmp = pipvercmp if kind == "pips" else rpmvercmp
+                        pick = max if bound == "min" else min
+                        w[bound] = pick(w[bound], e[bound], key=lambda v: _Key(v, cmp))
+                lo, hi = w.get("pin", w.get("min")), w.get("pin", w.get("max"))
+                if lo and hi and (pipvercmp if kind == "pips" else rpmvercmp)(lo, hi) > 0:
+                    raise Clash(f"{name}: needs at least {lo} and at most {hi} ({', '.join(w['from'])})")
+    return out
+
+
+class _Key:
+    def __init__(self, v, cmp):
+        self.v, self.cmp = v, cmp
+
+    def __lt__(self, other):
+        return self.cmp(self.v, other.v) < 0
+
+
+# -- the commands -------------------------------------------------------------------------------
+
+def survey(args, network=True, pips=True, tools=True):
+    return survey_from(wanted(args), network, pips, tools)
+
+
+def user_path(p):
+    """A tool's path with ~ as the home of whoever owns the coworker home: under sudo or a root login
+    ~ would be root's, and the tools are the user's."""
+    if p.startswith("~"):
+        try:
+            import pwd
+            return pwd.getpwuid(os.stat(HOME).st_uid).pw_dir + p[1:]
+        except (OSError, KeyError):
+            pass
+    return os.path.expanduser(p)
+
+
+def survey_from(w, network=True, pips=True, tools=True):
+    """[(kind, name, want, state, problem)] where problem is None when all is well."""
+    fam = family()
+    if not pips:
+        w["pips"] = {}
+    if not tools:
+        w["tools"] = {}
+    rows = []
+    vercmp = rpmvercmp if fam == "rpm" else debvercmp
+    for name, want in sorted(w["host"].items()):
+        have = installed_host(name, fam)
+        rows.append(("host", name, want, have or "not installed",
+                     "missing" if have is None else in_range(have, want, vercmp)))
+    for name, want in sorted(w["pips"].items()):
+        have = installed_pip(name)
+        rows.append(("pip", name, want, have or "not installed",
+                     "missing" if have is None else in_range(have, want, pipvercmp)))
+    for name, want in sorted(w["tools"].items()):
+        how, where = want["probe"]
+        found = shutil.which(where) if how == "command" else (user_path(where) if os.path.exists(user_path(where)) else None)
+        rows.append(("tool", name, want, found or f"no {where}", None if found else "missing"))
+    if network and w["network"]:
+        names = sorted(w["network"])
+        with ThreadPoolExecutor(16) as pool:
+            results = list(pool.map(lambda n: answers(n.rsplit(":", 1)[0], int(n.rsplit(":", 1)[1]),
+                                                      w["network"][n]["probe"]), names))
+        for name, (ok, how) in zip(names, results):
+            problem = None if ok else "certificate" if how.startswith("TLS certificate") else "unreachable"
+            rows.append(("net", name, w["network"][name], how, problem))
+    return rows
+
+
+def show(rows):
+    for kind, name, want, state, problem in rows:
+        label = name + (" " + spec_text(want) if spec_text(want) else "")
+        mark = "ok" if problem is None else problem.upper() if problem in ("missing", "unreachable", "certificate") else problem
+        print(f"  {kind:<4} {label:<40} {state:<22} {mark:<12} {'; '.join(want['why'])}  [{', '.join(want['from'])}]")
+
+
+def check(args):
+    network = "--no-network" not in args
+    args = [a for a in args if a != "--no-network"]
+    rows = survey(args, network)
+    print(f"platform {platform()} ({family()}), python {PYTHON}")
+    show(rows)
+    bad = [r for r in rows if r[4]]
+    if bad:
+        print(f"{len(bad)} to fix: 'deps install' prints the commands; 'deps hosts' lists the hosts for the firewall")
+    return 1 if bad else 0
+
+
+def host_command(rows):
+    """[argv] for the host packages rows say are missing or out of range: one dnf/apt-get, run as root."""
+    fam = family()
+    specs = []
+    for kind, name, want, _, problem in rows:
+        if kind != "host" or not problem:
+            continue
+        if "pin" in want:
+            specs.append(f"{name}-{want['pin']}" if fam == "rpm" else f"{name}={want['pin']}")
+        elif fam == "rpm" and "min" in want:
+            specs.append(f"{name} >= {want['min']}")
+        elif fam == "rpm" and "max" in want:
+            specs.append(f"{name} <= {want['max']}")
+        else:
+            specs.append(name)
+        if problem.startswith("above"):
+            print(f"# {name} is {problem}: dnf/apt won't downgrade it by itself", file=sys.stderr)
+    if not specs:
+        return []
+    return [["dnf", "install", "-y", *specs] if fam == "rpm" else ["apt-get", "install", "-y", *specs]]
+
+
+def pip_commands(rows):
+    """[argv] for the pips rows say are missing or out of range, into the user's site."""
+    pips = [r for r in rows if r[0] == "pip" and r[4]]
+    if not pips:
+        return []
+    out = [] if has_pip() else [[PYTHON, "-m", "ensurepip", "--user"]]
+    return out + [[PYTHON, "-m", "pip", "install", "--user", *(n + spec_text(w) for _, n, w, _, _ in pips)]]
+
+
+def display(argv):
+    """A command as shell text: the packages of one dnf/apt-get/pip call one per line, with \\."""
+    head = 3 if argv[0] in ("dnf", "apt-get") else 5 if argv[2:4] == ["pip", "install"] else len(argv)
+    words = [shlex.quote(a) for a in argv]
+    if len(argv) - head < 2:
+        return " ".join(words)
+    return " \\\n    ".join([" ".join(words[:head])] + words[head:])
+
+
+def run_all(cmds, dry):
+    for argv in cmds:
+        print(("" if dry else "+ ") + display(argv), flush=True)
+        if dry:
+            continue
+        r = subprocess.run(argv)
+        if r.returncode != 0:
+            print(f"deps: that failed (exit {r.returncode}); nothing after it was run", file=sys.stderr)
+            return False
+    return True
+
+
+def install(args):
+    sudo, dry = "--sudo" in args, "-n" in args or "--dry-run" in args
+    args = [a for a in args if a not in ("--sudo", "-n", "--dry-run")]
+    if sudo and euid() != 0:
+        if not dry:
+            print(f"deps: install --sudo installs host packages and must run as root: {SUDO_HINT}", file=sys.stderr)
+            return 2
+        print(f"# not root: the real run must be: {SUDO_HINT}", file=sys.stderr)
+    if not sudo and euid() == 0:
+        print("deps: install runs as the user (the pips go in the user's site); as root, use --sudo", file=sys.stderr)
+        return 2
+    if sudo:        # root: the host packages only
+        cmds = host_command(survey(args, network=False, pips=False, tools=False))
+        if not cmds:
+            print("# no host packages to install", file=sys.stderr)
+            return 0
+        if not run_all(cmds, dry):
+            return 1
+        if dry:
+            return 0
+        left = [r for r in survey(args, network=False, pips=False, tools=False) if r[4]]
+        if left:
+            print("still to fix after the install:")
+            show(left)
+            return 1
+        print("host packages installed")
+        return 0
+    rows = survey(args, network=False)
+    if not run_all(pip_commands(rows), dry):
+        return 1
+    tools = [r for r in rows if r[0] == "tool" and r[4]]
+    if dry:     # stdout: only what this run would run; the other halves on stderr
+        for argv in host_command(rows):
+            print("# as root (" + SUDO_HINT + "):\n# " + display(argv).replace("\n", "\n# "), file=sys.stderr)
+        for _, name, want, _, _ in tools:
+            print(f"# {name}, by hand: {want['how']}", file=sys.stderr)
+        return 0
+    left = [r for r in survey(args, network=False) if r[4]]
+    if not left:
+        print("everything installed")
+        return 0
+    if tools:
+        print(f"{len(tools)} tool(s) come from their own installers, which deps never runs:")
+        for _, name, want, _, _ in tools:
+            print(f"  {name}: {want['how']}    # {'; '.join(want['why'])}")
+    host_left = [r for r in left if r[0] == "host"]
+    if host_left:
+        print(f"{len(host_left)} host package(s) need root: the machine's owner runs\n    {SUDO_HINT}")
+    rest = [r for r in left if r[0] not in ("host", "tool")]
+    if rest:
+        print("still to fix:")
+        show(rest)
+    return 1
+
+
+def hosts(args):
+    rows = survey(args, network=True)
+    rows = [r for r in rows if r[0] == "net"]
+    for _, name, want, state, problem in rows:
+        mark = {None: "ok", "certificate": "CERTIFICATE"}.get(problem, "BLOCKED")
+        print(f"{name:<44} {mark:<12} {state:<26} {'; '.join(want['why'])}  [{', '.join(want['from'])}]")
+    return 1 if any(r[4] for r in rows) else 0
+
+
+def register(args):
+    """For any project script's first line: remember the checkout, and say (not fail) if the host
+    lacks something the project needs."""
+    if len(args) != 1:
+        raise Bad("usage: deps register DIR")
+    folder = os.path.realpath(args[0])
+    data = load(folder)
+    project = project_name(folder)
+    if euid() != 0:
+        remember(folder, project)
+    left = [r for r in survey_from(wanted_from([(project, data)]), network=False) if r[4]]
+    if left:
+        print(f"coworker: the host lacks {len(left)} of {project}'s needs ({', '.join(r[1] for r in left[:3])}"
+              f"{', ...' if len(left) > 3 else ''}): {os.path.join(HOME, 'bin', 'deps')} check {folder}", file=sys.stderr)
+    return 0
+
+
+def status(args):
+    """coworker status, the first step on a machine: register the project, do what needs no human, and
+    list what's waiting on one, each with its command (exit 3). With COWORKER_UNATTENDED=1 (CI) do
+    those too, and fail (1) on what still can't be done."""
+    network = "--no-network" not in args
+    args = [a for a in args if a != "--no-network"]
+    if len(args) != 1:
+        raise Bad("usage: deps status [--no-network] DIR")
+    folder = os.path.realpath(args[0])
+    load(folder)
+    project = project_name(folder)
+    me = os.path.realpath(__file__)
+    unattended = os.environ.get("COWORKER_UNATTENDED") == "1"
+    print(f"coworker {protocol()} in {HOME}; {project} at {folder}")
+    if unattended:
+        rows = survey([folder], network=False)
+        ok = run_all(pip_commands(rows), False)
+        for kind, name, want, _, problem in rows:
+            if ok and problem and kind == "tool":
+                print(f"+ {want['how']}", flush=True)
+                ok = subprocess.run(["sh", "-c", want["how"]]).returncode == 0
+        if ok and host_command(rows):
+            ok = run_all(host_command(rows) if euid() == 0 else [["sudo", "-n", me, "install", "--sudo", folder]], False)
+    rows = survey([folder], network=network)
+    left = [r for r in rows if r[4]]
+    if not left:
+        print("ready: nothing is waiting")
+        return 0
+    if unattended:
+        print("still missing after the unattended install:")
+        show(left)
+        return 1
+    print("waiting on a human (README.md, \"A new machine\"):")
+    kinds = {r[0] for r in left}
+    if "pip" in kinds:
+        print(f"  pips, into the user's site, which the machine's projects share:\n    {me} install {folder}")
+    for _, name, want, _, _ in (r for r in left if r[0] == "tool"):
+        print(f"  {name}, from its own installer, in the user's home:\n    {want['how']}")
+    if "host" in kinds:
+        print(f"  host packages, as root:\n    sudo {me} install --sudo {folder}")
+    if "net" in kinds:
+        print(f"  network hosts that don't answer (a firewall's to open):\n    {me} hosts {folder}")
+    show(left)
+    return 3
+
+
+# -- shared VMs (vms run) ----------------------------------------------------------------------
+
+def vm_folder(vm):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", vm) or vm.startswith("."):
+        raise Bad(f"{vm!r} isn't a VM's name: letters, digits, '-', '_' and '.'")
+    return os.path.join(HOME, "vms", vm)
+
+
+def vm_env(vm):
+    """The VM's vm.env as a dict, with VM_SSH_KEY and VM_KNOWN_HOSTS made absolute."""
+    folder = vm_folder(vm)
+    path = os.path.join(folder, "vm.env")
+    if not os.path.exists(path):
+        raise Bad(f"no {path} (README.md, \"vm.env\")")
+    env = {}
+    for line in open(path):
+        m = re.match(r"\s*([A-Z_][A-Z0-9_]*)=(.*)$", line)
+        if m:
+            v = m.group(2).strip()
+            env[m.group(1)] = shlex.split(v)[0] if v else ""
+    for k in ("VM_SSH_PORT", "VM_SSH_USER", "VM_SSH_KEY"):
+        if not env.get(k):
+            raise Bad(f"{path} sets no {k}")
+    env.setdefault("VM_SSH_HOST", "127.0.0.1")
+    env.setdefault("VM_KNOWN_HOSTS", "known_hosts")
+    for k in ("VM_SSH_KEY", "VM_KNOWN_HOSTS"):
+        env[k] = os.path.join(folder, env[k])
+    return env
+
+
+def vm_claims(vm):
+    """[(project, needs)] from the claim files beside the VM's folder; an empty claim (vms claim)
+    needs nothing."""
+    d = os.path.join(HOME, "vms")
+    out = []
+    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if not f.startswith(vm + ".") or "." in f[len(vm) + 1:] or f[len(vm) + 1:] in ("", "lock"):
+            continue
+        with open(os.path.join(d, f)) as h:
+            text = h.read().strip()
+        try:
+            needs = json.loads(text)["needs"] if text else {}
+        except (json.JSONDecodeError, KeyError, TypeError):
+            raise Bad(f"{os.path.join(d, f)}: not a claim vms run wrote; claim again or delete it")
+        out.append((f[len(vm) + 1:], needs))
+    return out
+
+
+def merge_os(vm, claims):
+    """The one guest every claimant can live with: the same family, name and version, the highest
+    min and lowest max of the build. A Clash when there isn't one."""
+    out = None
+    for project, needs in claims:
+        o = needs.get("os")
+        if not o:
+            continue
+        if out is None:
+            out = {"from": [], "why": []}
+        if "name" in o and "name" in out:       # both must be in the guest's name: one inside the other
+            a, b = out["name"], o["name"]
+            if a.lower() in b.lower() or b.lower() in a.lower():
+                out["name"] = max(a, b, key=len)            # whichever came first: the merge is order-free
+                o = {**o, "name": out["name"]}
+        for k in ("family", "name", "version"):
+            if k in o:
+                if k in out and out[k] != o[k]:
+                    raise Clash(f"{vm}: {', '.join(out['from'])} need{'s' if len(out['from']) == 1 else ''} "
+                                f"{k} {out[k]!r}, {project} needs {o[k]!r}")
+                out[k] = o[k]
+        for bound in ("min", "max", "pin"):
+            if bound not in o:
+                continue
+            if bound not in out or out[bound] == o[bound]:
+                out[bound] = o[bound]
+            elif bound == "pin":
+                raise Clash(f"{vm}: build pinned to {out['pin']} ({', '.join(out['from'])}) and to {o['pin']} ({project})")
+            else:
+                pick = max if bound == "min" else min
+                out[bound] = pick(out[bound], o[bound], key=lambda v: _Key(v, pipvercmp))
+        out["from"].append(project)
+        out["why"].append(o["why"])
+        lo, hi = out.get("pin", out.get("min")), out.get("pin", out.get("max"))
+        if lo and hi and pipvercmp(lo, hi) > 0:
+            raise Clash(f"{vm}: build at least {lo} and at most {hi} ({', '.join(out['from'])})")
+    return out
+
+
+def os_text(o):
+    parts = [o.get("name", o["family"]), o.get("version", "")]
+    spec = spec_text(o).replace("==", "build ").replace(">=", "build >= ").replace("<=", "build <= ")
+    return " ".join(p for p in parts + [spec] if p) + f"  [{', '.join(o['from'])}]"
+
+
+def vm_claim(args):
+    if len(args) != 2:
+        raise Bad("usage: deps vm-claim VM DIR")
+    vm, d = args
+    folder = os.path.realpath(d)
+    data = load(folder)
+    project = project_name(folder)
+    vf = vm_folder(vm)
+    if not os.path.isdir(vf):
+        raise Bad(f"no VM {vm} in {os.path.dirname(vf)}")
+    needs = data.get("vms", {}).get(vm, {})
+    path = os.path.join(os.path.dirname(vf), f"{vm}.{project}")
+    with open(path + ".new", "w") as f:
+        json.dump({"project": project, "dir": folder, "needs": needs}, f, indent=2)
+        f.write("\n")
+    os.replace(path + ".new", path)
+    remember(folder, project)
+    claims = vm_claims(vm)
+    o = merge_os(vm, claims)                     # a Clash stops here, before anything runs
+    # what using the VM takes: coworker's own needs and every claimant's host needs for this VM.
+    # The project's other needs (its own tests', say) only get a mention: this run doesn't use them.
+    sources = [("coworker", load(HOME))] if os.path.exists(os.path.join(HOME, ".coworker", "deps.json")) else []
+    sources += [(f"{p}, for {vm}", n) for p, n in claims if any(n.get(k) for k in KEYS)]
+    left = [r for r in survey_from(wanted_from(sources), network=False) if r[4]]
+    others = [r for r in survey_from(wanted_from([(project, data)]), network=False) if r[4]]
+    print(f"{project} claims {vm}" + (f"; its projects need {os_text(o)}" if o else ""))
+    if others:
+        print(f"  (the host lacks {len(others)} of {project}'s other needs, which this run doesn't use: deps check {folder})")
+    if left:
+        print(f"the host is missing what using {vm} needs:")
+        show(left)
+        print(f"  'deps install {folder}' installs the pips; host packages: {SUDO_HINT}")
+        return 1
+    return 0
+
+
+def ssh_argv(env, command):
+    return [SSH, "-i", env["VM_SSH_KEY"], "-p", str(env["VM_SSH_PORT"]), "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={env['VM_KNOWN_HOSTS']}",
+            "-o", "ConnectTimeout=5", f"{env['VM_SSH_USER']}@{env['VM_SSH_HOST']}", command]
+
+
+GUEST_QUERY = {
+    # build (numbers only) | the version people call it | the product's name
+    "windows": ("powershell -NoProfile -NonInteractive -Command -",
+                "$v = [Environment]::OSVersion.Version\n"
+                "$c = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'\n"
+                "$n = (Get-CimInstance Win32_OperatingSystem).Caption -replace '^Microsoft ', ''\n"
+                "Write-Output (\"{0}.{1}.{2}.{3}|{4}|{5}\" -f $v.Major, $v.Minor, $v.Build, $c.UBR, $c.DisplayVersion, $n)\n"),
+    "linux": ("sh -s", '. /etc/os-release; echo "${VERSION_ID}|${VERSION_ID}|${NAME}"\n'),
+}
+
+
+def vm_guest(args):
+    wait = 0.0
+    if "--wait" in args:
+        i = args.index("--wait")
+        wait = float(args[i + 1])
+        args = args[:i] + args[i + 2:]
+    if len(args) != 1:
+        raise Bad("usage: deps vm-guest VM [--wait SECONDS]")
+    vm = args[0]
+    env = vm_env(vm)
+    claims = vm_claims(vm)
+    o = merge_os(vm, claims)
+    deadline, last = time.monotonic() + wait, ""
+    while True:
+        r = subprocess.run(ssh_argv(env, "echo up"), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if r.returncode == 0:
+            break
+        last = (r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1]
+        if time.monotonic() >= deadline:
+            raise Unmet(f"{vm}: no SSH at {env['VM_SSH_USER']}@{env['VM_SSH_HOST']}:{env['VM_SSH_PORT']}"
+                        f"{f' after {wait:.0f} s' if wait else ''}: {last}")
+        time.sleep(min(5.0, max(0.1, deadline - time.monotonic())))
+    if not o:
+        print(f"{vm}: answers; its projects state no OS needs")
+        return 0
+    command, script = GUEST_QUERY[o["family"]]
+    r = subprocess.run(ssh_argv(env, command), input=script, capture_output=True, text=True)
+    out = [l for l in r.stdout.replace("\r", "").splitlines() if l.count("|") == 2]
+    if r.returncode != 0 or not out:
+        raise Unmet(f"{vm}: couldn't ask the guest its OS ({o['family']}): {r.stderr.strip() or r.stdout.strip()}")
+    build, version, name = out[-1].split("|")
+    have = f"{name} {version} (build {build})"
+    wrong = []
+    if o.get("name") and o["name"].lower() not in name.lower():
+        wrong.append(f"not {o['name']}")
+    if o.get("version") and o["version"] != version:
+        wrong.append(f"version {version}, not {o['version']}")
+    miss = in_range(build, o, pipvercmp)
+    if miss:
+        wrong.append(f"build {build} is {miss}")
+    if wrong:
+        raise Unmet(f"{vm} runs {have}: {'; '.join(wrong)}. Its projects need {os_text(o)}: "
+                    f"{'; '.join(o['why'])}")
+    print(f"{vm} runs {have}: meets {os_text(o)}")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] not in ("check", "install", "hosts", "register", "status", "vm-claim", "vm-guest"):
+        print(USAGE, file=sys.stderr)
+        return 2
+    try:
+        if argv[0] in ("register", "status", "vm-claim"):
+            client()
+        return {"check": check, "install": install, "hosts": hosts, "register": register, "status": status,
+                "vm-claim": vm_claim, "vm-guest": vm_guest}[argv[0]](argv[1:])
+    except Bad as e:
+        print(f"deps: {e}", file=sys.stderr)
+        return e.code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
