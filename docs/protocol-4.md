@@ -29,6 +29,8 @@ for working on coworker.
 | 4 | **No automatic change** to the installed coworker, up or down. A mismatch stops and says what to do; a human decides |
 | 5 | Project scripts **always call the submodule**. It negotiates with the installed coworker and hands over everything it can, so install and upgrade are the only things run from the submodule's own code, and only on a human's say-so. It never does a shared-state command itself (its claims and locks would be private to one project, so two projects could boot one VM) |
 | 6 | **The first step on any machine is getting coworker installed.** After that, "not installed" doesn't come up on the host |
+| 7 | **All the clients on a machine upgrade together**, with the install, so there are no old clients to keep serving. The handshake only catches a client that was missed |
+| 8 | **CI has no human**, so everything runs without one there |
 
 ## Design
 
@@ -82,15 +84,21 @@ its scripts made the check fail hard.
 and the other calls are `"$HERE/coworker/bin/vms" ...` and `"$HERE/coworker/bin/downloads" ...`.
 No `COWORKER_HOME` handling and no installed check stay in project scripts.
 
-**CI.** `actions/checkout` with `submodules: true`, then `coworker/bin/coworker install`: the same
-path as on a machine, and the copied commit IDs leave the workflows. On a fresh CI machine, CI is the
-human's say-so, given once in the workflow.
+**Unattended (CI).** With `COWORKER_UNATTENDED=1`, everything the table below marks **asked**
+is done instead, as if the human had said yes: installing coworker (with `--change` if needed),
+shared tools, host packages (through `sudo -n`, which fails rather than prompts). Nothing waits,
+so exit 3 never happens: a step that can't be done fails with 1. It's set explicitly, never
+inferred from `CI=true`, so a developer's shell that happens to carry `CI` doesn't act on its own.
+
+**CI.** `actions/checkout` with `submodules: true`, then
+`COWORKER_UNATTENDED=1 coworker/bin/coworker status`: the same path as on a machine, with the
+install done unattended. The copied commit IDs leave the workflows.
 
 ## A client project on a new machine: what's automated, what's asked
 
 The rule: anything that changes what other projects use, needs root, or is costly to undo is the
 human's call. What's read-only, or touches only this project, is automated. `status` says which is
-which.
+which. Unattended (CI), the asked steps are done too.
 
 | Step | Who |
 |---|---|
@@ -114,19 +122,11 @@ use".
 
 1. Coworker: `PROTOCOL`, the launcher (`bin/`) and the commands moved to `libexec/`, the two-way
    check, `install --change`, `status`, exit 3, tests (each row of the handshake table, an old
-   launcher against a new install and the reverse, install refusing a change without the flag), and
-   the README. Released as `4.0`.
+   launcher against a new install and the reverse, install refusing a change without the flag, an
+   unattended run doing the asked steps and never exiting 3), and the README. Released as `4.0`.
 2. Each client project, one PR each: add the submodule at the 4.0 commit, call coworker through it,
-   switch CI to `submodules: true` + `coworker/bin/coworker install`, and make the docs' first step
-   `coworker/bin/coworker status`. One project first, as the proof, then the rest.
-3. The installed coworker moves to 4.0 once, by the owner (decision 4), after step 1 merges.
-   Projects not moved yet call `$COWORKER_HOME/bin/*` directly with no `COWORKER_CLIENT_PROTOCOL`.
-   A 4.0 install treats that as protocol 3 and serves it, with one line saying the project isn't on
-   protocol 4 yet, until every client project has moved. Then a 4.x minor release drops it.
-
-## Open questions
-
-- **Protocol 3 clients after the move.** The plan serves them until every client has moved, then
-  drops them. Or should an install keep serving the previous major for good?
-- **CI's say-so.** Is installing coworker in CI covered once by the workflow, as above, or should CI
-  need an explicit setting such as `COWORKER_INSTALL=yes`?
+   switch CI to the unattended `status`, and make the docs' first step `coworker/bin/coworker status`.
+   Each PR's CI proves it on its own runner.
+3. The machine moves at once (decision 7): the owner merges every client's PR, then installs 4.0.
+   Projects call the submodule from then on. An installed command called without
+   `COWORKER_CLIENT_PROTOCOL` (a client that was missed) refuses with exit 3 and says to move it.
