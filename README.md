@@ -16,6 +16,7 @@ home, which also holds the shared things; the checkout itself never holds them.
 | `$COWORKER_HOME/bin/vms` | shares virtual machines ([VMs](#vms)) |
 | `$COWORKER_HOME/bin/deps` | checks what the projects need installed and reachable ([Dependencies](#dependencies)) |
 | `$COWORKER_HOME/.coworker/deps.json` | coworker's own needs, installed from this checkout's |
+| `$COWORKER_HOME/projects/` | each project `deps` has seen: `<project>` holds its checkout's path |
 | `$COWORKER_HOME/downloads/` | the downloads, with their checksums and claims |
 | `$COWORKER_HOME/vms/` | the VMs' folders, with their claims and locks |
 | `$COWORKER_HOME/VERSION` | what's installed (`git describe` of the checkout it came from) |
@@ -190,24 +191,37 @@ Maintenance:
 
 Each project says in its own `.coworker/deps.json` what the machine must have for it: host packages,
 pips in the system Python, and network hosts it reaches. `deps` reads those files, and coworker's
-own, and says what's missing, prints the commands that install it, and lists the hosts for the
-machine's firewall. It never installs anything itself: host packages need `sudo`, which is the
-machine owner's.
+own, and says what's missing, installs it, and lists the hosts for the machine's firewall. The
+install has two halves: what the user can install (the pips), which an agent runs, and the host
+packages, which need root and which the machine's owner runs with `sudo`.
 
     deps check   [--no-network] [DIR...]
-    deps install [DIR...]
+    deps install [-n] [DIR...]                 as the user, never root
+    sudo ~/coworker/bin/deps install --sudo [-n] [DIR...]   as root only
     deps hosts   [DIR...]
 
 - **`check`** lists every need with what's installed and whether it's met, and whether each host
   answers. Exit 1 if anything is missing, out of range or unreachable; 2 if a `deps.json` is wrong or
   two projects' needs clash.
-- **`install`** prints the commands: one `sudo dnf install` (or `sudo apt-get install`) and one
-  `pip install --user` (after `ensurepip --user` when the Python has no pip). It runs nothing.
+- **`install`** (as the user; it refuses to run as root) installs the missing pips into the user's
+  site (`pip install --user`, after `ensurepip --user` when the Python has no pip), checks again, and
+  says which host packages are left for the `--sudo` run. Exit 0 only when nothing is left.
+- **`install --sudo`** (as root; it refuses otherwise) installs the missing host packages with one
+  `dnf install` (or `apt-get install`), checks them again, and writes nothing in the user's home.
+  Under `sudo`, which resets `HOME`, it finds the invoking user's coworker home through `SUDO_USER`.
+- **`-n`** prints the commands either half would run, and runs nothing. Each half stops at the
+  first command that fails.
 - **`hosts`** lists every network host the projects need, whether it answers, and why it's needed:
-  what to open on a firewall.
+  what to open on a firewall. `BLOCKED` is no answer (or not as far as the probe goes);
+  `CERTIFICATE` is an answer with a certificate the system doesn't accept for that name, which a
+  firewall rule doesn't fix.
 
 A `DIR` is a project's checkout. Coworker's own `deps.json` (installed with the commands) always
-counts too.
+counts too. Each `DIR` is remembered in `$COWORKER_HOME/projects/<project>` (a file holding the
+checkout's path), so with no `DIR` every project the machine has seen counts: setting up a machine
+is installing coworker, one `deps check` in each project, `deps install`, and the owner's
+`sudo ~/coworker/bin/deps install --sudo`. A remembered
+checkout that's gone is skipped and said; delete its file when the project is.
 
 ### `.coworker/deps.json`
 
@@ -253,7 +267,8 @@ Rules:
   it finishes; `http`, a request naming it gets a status line back; `tcp`, the connection opens. A
   firewall that filters by name lets the connection open and then never answers, so a connection
   alone proves nothing for HTTPS or HTTP.
-- **No `sudo` here.** `deps install` prints what to run; the machine's owner runs the `sudo` part.
+- **`sudo` is the owner's.** An agent runs `deps install` and never the `--sudo` half; when host
+  packages are missing it asks the owner to run `sudo ~/coworker/bin/deps install --sudo`.
 
 ## Tests
 

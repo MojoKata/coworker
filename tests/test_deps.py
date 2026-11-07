@@ -18,8 +18,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DEPS = str(ROOT / "bin" / "deps")
 
 RPM = """#!/bin/sh
-# rpm -q --qf FORMAT NAME, answered from FAKE_RPMS ("name=version-release ...")
-for kv in $FAKE_RPMS; do [ "${kv%%=*}" = "$4" ] && { echo "${kv#*=}"; exit 0; }; done
+# rpm -q --qf FORMAT NAME, answered from FAKE_RPMS ("name=version-release ...") and the file FAKE_RPMDB
+for kv in $FAKE_RPMS $(cat "$FAKE_RPMDB" 2>/dev/null); do [ "${kv%%=*}" = "$4" ] && { echo "${kv#*=}"; exit 0; }; done
 echo "package $4 is not installed"; exit 1
 """
 DPKG_QUERY = """#!/bin/sh
@@ -27,10 +27,21 @@ DPKG_QUERY = """#!/bin/sh
 for kv in $FAKE_DEBS; do [ "${kv%%=*}" = "$4" ] && { printf 'installed %s' "${kv#*=}"; exit 0; }; done
 exit 1
 """
+DNF = """#!/bin/sh
+# dnf install -y SPEC... (or apt-get): logs the command and "installs" each spec's name at 9.9 into FAKE_RPMDB
+echo "$(basename "$0") $*" >> "$FAKE_LOG"
+shift 2
+for spec in "$@"; do set -- $spec; n=${1%%-[0-9]*}; echo "${n%%=*}=9.9-1" >> "$FAKE_RPMDB"; done
+"""
 PYTHON = """#!/bin/sh
 # python -m pip --version | python -c CODE NAME, answered from FAKE_HAS_PIP and FAKE_PIPS
+if [ "$1 $2 $3" = "-m pip install" ]; then
+  echo "python $*" >> "$FAKE_LOG"; shift 4
+  for spec in "$@"; do echo "${spec%%[<>=]*}=99.0" >> "$FAKE_PIPDB"; done; exit 0
+fi
+if [ "$1 $2" = "-m ensurepip" ]; then echo "python $*" >> "$FAKE_LOG"; exit 0; fi
 if [ "$1" = -m ]; then [ -n "$FAKE_HAS_PIP" ]; exit $?; fi
-for kv in $FAKE_PIPS; do [ "${kv%%=*}" = "$3" ] && { echo "${kv#*=}"; exit 0; }; done
+for kv in $FAKE_PIPS $(cat "$FAKE_PIPDB" 2>/dev/null); do [ "${kv%%=*}" = "$3" ] && { echo "${kv#*=}"; exit 0; }; done
 exit 3
 """
 
@@ -50,12 +61,14 @@ class Case(unittest.TestCase):
         self.home = self.tmp / "coworker"
         stubs = self.tmp / "stubs"
         stubs.mkdir()
-        for name, text in (("rpm", RPM), ("dpkg-query", DPKG_QUERY), ("python", PYTHON)):
+        for name, text in (("rpm", RPM), ("dpkg-query", DPKG_QUERY), ("python", PYTHON), ("dnf", DNF), ("apt-get", DNF)):
             (stubs / name).write_text(text)
             (stubs / name).chmod(0o755)
         self.env = {**os.environ, "COWORKER_HOME": str(self.home), "COWORKER_PLATFORM": "rocky-10.2",
                     "COWORKER_FAMILY": "rpm", "COWORKER_PYTHON": str(stubs / "python"),
-                    "PATH": f"{stubs}:{os.environ['PATH']}", "FAKE_RPMS": "", "FAKE_PIPS": "", "FAKE_HAS_PIP": "1"}
+                    "PATH": f"{stubs}:{os.environ['PATH']}", "FAKE_RPMS": "", "FAKE_PIPS": "", "FAKE_HAS_PIP": "1",
+                    "FAKE_LOG": str(self.tmp / "log"), "FAKE_RPMDB": str(self.tmp / "rpmdb"),
+                    "FAKE_PIPDB": str(self.tmp / "pipdb"), "COWORKER_EUID": "1000"}
 
     def project(self, name, deps, folder=None):
         d = self.tmp / (folder or name)
@@ -171,28 +184,105 @@ class Check(Case):
 
 
 class Install(Case):
-    def test_dnf_gets_the_ranges_and_pins_and_runs_nothing(self):
-        p = self.project("one", {"host": [{"package": "a", "min": "1.2", "why": "w"},
-                                          {"package": "b", "pin": "2.0", "why": "w"},
-                                          {"package": "c", "max": "3", "why": "w"},
-                                          {"package": "ok", "why": "already there"}]})
-        out = self.deps("install", p, rc=0, FAKE_RPMS="ok=1-1").stdout
-        self.assertEqual(out.strip(), "sudo dnf install -y 'a >= 1.2' b-2.0 'c <= 3'")
+    ROOT = {"COWORKER_EUID": "0"}
+
+    def log(self):
+        f = self.tmp / "log"
+        return f.read_text().splitlines() if f.exists() else []
+
+    def test_as_the_user_it_installs_the_pips_and_leaves_host_packages_to_root(self):
+        p = self.project("one", {"host": [{"package": "a", "why": "w"}],
+                                 "pips": [{"pip": "pillow", "min": "13.0.0", "why": "w"}]})
+        res = self.deps("install", p, rc=1)
+        py = self.env["COWORKER_PYTHON"]
+        self.assertEqual(self.log(), ["python -m pip install --user pillow>=13.0.0"])
+        self.assertIn("1 host package(s) need root", res.stdout)
+        self.assertIn("sudo ~/coworker/bin/deps install --sudo", res.stdout)
+
+    def test_pip_comes_first_when_the_python_has_none(self):
+        p = self.project("one", {"pips": [{"pip": "pillow", "why": "w"}]})
+        res = self.deps("install", p, rc=0, FAKE_HAS_PIP="")
+        self.assertEqual(self.log(), ["python -m ensurepip --user", "python -m pip install --user pillow"])
+        self.assertIn("everything installed", res.stdout)
+
+    def test_as_root_without_sudo_it_refuses(self):
+        p = self.project("one", {"pips": [{"pip": "pillow", "why": "w"}]})
+        self.assertIn("as root, use --sudo", self.deps("install", p, rc=2, **self.ROOT).stderr)
+        self.assertEqual(self.log(), [])
+
+    def test_sudo_mode_refuses_unless_root(self):
+        p = self.project("one", {"host": [{"package": "a", "why": "w"}]})
+        self.assertIn("must run as root", self.deps("install", "--sudo", p, rc=2).stderr)
+        self.assertEqual(self.log(), [])
+
+    def test_sudo_mode_installs_host_packages_with_ranges_and_pins_then_checks(self):
+        p = self.project("one", {"host": [{"package": "a", "min": "1.2", "why": "w"}, {"package": "b", "pin": "9.9", "why": "w"},
+                                          {"package": "c", "max": "10", "why": "w"}, {"package": "ok", "why": "there"}],
+                                 "pips": [{"pip": "pillow", "why": "the user's, not root's"}]})
+        res = self.deps("install", "--sudo", p, rc=0, FAKE_RPMS="ok=1-1", **self.ROOT)
+        self.assertEqual(self.log(), ["dnf install -y a >= 1.2 b-9.9 c <= 10"])
+        self.assertIn("host packages installed", res.stdout)
+        self.assertFalse((self.home / "projects").exists(), "root wrote in the user's coworker home")
+
+    def test_sudo_mode_says_what_is_still_wrong_after(self):
+        p = self.project("one", {"host": [{"package": "a", "min": "10", "why": "w"}]})
+        res = self.deps("install", "--sudo", p, rc=1, **self.ROOT)      # the stand-in installs 9.9
+        self.assertIn("still to fix", res.stdout)
+        self.assertIn("below 10", res.stdout)
+
+    def test_a_failing_command_stops_the_run(self):
+        p = self.project("one", {"host": [{"package": "a", "why": "w"}]})
+        (self.tmp / "stubs" / "dnf").write_text("#!/bin/sh\nexit 7\n")
+        res = self.deps("install", "--sudo", p, rc=1, **self.ROOT)
+        self.assertIn("exit 7", res.stderr)
+        self.assertIn("nothing after it was run", res.stderr)
+
+    def test_dry_run_prints_both_parts_and_runs_nothing(self):
+        p = self.project("one", {"host": [{"package": "a", "min": "1.2", "why": "w"}],
+                                 "pips": [{"pip": "pillow", "min": "13.0.0", "why": "w"}]})
+        out = self.deps("install", "-n", p, rc=0).stdout.splitlines()
+        py = self.env["COWORKER_PYTHON"]
+        self.assertEqual(out, [f"{py} -m pip install --user 'pillow>=13.0.0'",
+                               "# as root (sudo ~/coworker/bin/deps install --sudo): dnf install -y 'a >= 1.2'"])
+        self.assertEqual(self.deps("install", "--sudo", "-n", p, rc=0, **self.ROOT).stdout.strip(), "dnf install -y 'a >= 1.2'")
+        self.assertEqual(self.log(), [])
 
     def test_apt_gets_names_and_pins(self):
         p = self.project("one", {"host": [{"package": "libgl1", "why": "w"}, {"package": "b", "pin": "2.0", "why": "w"}]})
-        out = self.deps("install", p, rc=0, COWORKER_FAMILY="deb", COWORKER_PLATFORM="ubuntu-24.04", FAKE_DEBS="").stdout
-        self.assertEqual(out.strip(), "sudo apt-get install -y b=2.0 libgl1")
-
-    def test_pips_go_to_the_user_site_with_pip_first_if_missing(self):
-        p = self.project("one", {"pips": [{"pip": "pillow", "min": "13.0.0", "why": "w"}]})
-        out = self.deps("install", p, rc=0, FAKE_HAS_PIP="").stdout.splitlines()
-        py = self.env["COWORKER_PYTHON"]
-        self.assertEqual(out, [f"{py} -m ensurepip --user", f"{py} -m pip install --user 'pillow>=13.0.0'"])
+        out = self.deps("install", "--sudo", "-n", p, rc=0, COWORKER_FAMILY="deb", COWORKER_PLATFORM="ubuntu-24.04",
+                        FAKE_DEBS="", **self.ROOT).stdout
+        self.assertEqual(out.strip(), "apt-get install -y b=2.0 libgl1")
 
     def test_nothing_missing_says_so(self):
         p = self.project("one", {"host": [{"package": "a", "why": "w"}]})
-        self.assertEqual(self.deps("install", p, rc=0, FAKE_RPMS="a=1-1").stdout.strip(), "# nothing to install")
+        self.assertIn("everything installed", self.deps("install", p, rc=0, FAKE_RPMS="a=1-1").stdout)
+        self.assertIn("no host packages", self.deps("install", "--sudo", p, rc=0, FAKE_RPMS="a=1-1", **self.ROOT).stdout)
+
+    def test_under_sudo_the_home_is_the_invoking_users(self):
+        import pwd
+        me = pwd.getpwuid(os.getuid())
+        env = {k: v for k, v in self.env.items() if k != "COWORKER_HOME"}
+        code = ("import importlib.machinery as m, importlib.util as u; l = m.SourceFileLoader('d', %r); "
+                "s = u.spec_from_loader('d', l); d = u.module_from_spec(s); l.exec_module(d); print(d.HOME)") % DEPS
+        out = subprocess.run(["python3", "-c", code], capture_output=True, text=True,
+                             env={**env, "COWORKER_EUID": "0", "SUDO_USER": me.pw_name, "HOME": "/root"}).stdout.strip()
+        self.assertEqual(out, os.path.join(me.pw_dir, "coworker"))
+
+
+class Remembered(Case):
+    def test_a_dir_is_remembered_and_a_run_with_none_covers_it(self):
+        p = self.project("checkout", {"project": "one", "host": [{"package": "a", "why": "w"}]})
+        self.deps("check", "--no-network", p, rc=1)
+        self.assertEqual((self.home / "projects" / "one").read_text().strip(), p)
+        self.assertIn("dnf install -y a", self.deps("install", "-n", rc=0).stdout)
+
+    def test_a_remembered_checkout_that_is_gone_is_skipped_and_said(self):
+        p = self.project("checkout", {"project": "one", "host": [{"package": "a", "why": "w"}]})
+        self.deps("check", "--no-network", p, rc=1)
+        shutil.rmtree(p)
+        res = self.deps("install", rc=0)
+        self.assertIn("everything installed", res.stdout)
+        self.assertIn("one:", res.stderr)
 
 
 class Network(Case):
@@ -209,7 +299,7 @@ class Network(Case):
         cls.cert = cert
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
-        cls.socks = []
+        cls.socks, cls.held = [], []
 
         def serve(kind):
             s = socket.socket()
@@ -234,7 +324,8 @@ class Network(Case):
                             c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                         finally:
                             c.close()
-                    # silent: keep it open and say nothing
+                    else:
+                        cls.held.append(c)      # silent: keep it open and say nothing
             threading.Thread(target=loop, daemon=True).start()
             return s.getsockname()[1]
 
@@ -246,7 +337,7 @@ class Network(Case):
 
     @classmethod
     def tearDownClass(cls):
-        for s in cls.socks:
+        for s in cls.socks + cls.held:
             s.close()
         shutil.rmtree(cls.dir)
 
@@ -260,7 +351,7 @@ class Network(Case):
         lines = {l.split()[0]: l for l in res.stdout.splitlines()}
         self.assertIn(" ok ", lines[f"localhost:{self.tls_port}"])
         self.assertIn("no answer to the TLS handshake", lines[f"localhost:{self.silent_port}"])
-        self.assertIn("UNREACHABLE", lines[f"localhost:{self.closed_port}"])
+        self.assertIn("BLOCKED", lines[f"localhost:{self.closed_port}"])
 
     def test_an_http_host_answers_only_if_a_request_gets_a_status_line(self):
         p = self.project("one", {"network": [{"host": "localhost", "port": self.silent_port, "probe": "http", "why": "silent"},
@@ -284,7 +375,9 @@ class Network(Case):
 
     def test_a_certificate_that_doesnt_verify_is_a_problem(self):
         p = self.project("one", {"network": [{"host": "localhost", "port": self.tls_port, "why": "self-signed"}]})
-        self.assertIn("TLS certificate", self.deps("hosts", p, rc=1, COWORKER_NET_TIMEOUT="1").stdout)
+        out = self.deps("hosts", p, rc=1, COWORKER_NET_TIMEOUT="1").stdout
+        self.assertIn("CERTIFICATE", out)
+        self.assertIn("TLS certificate", out)
 
 
 class InstallScript(Case):

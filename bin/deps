@@ -3,11 +3,15 @@
 one's .coworker/deps.json. README.md, "Dependencies".
 
   deps check   [--no-network] [DIR...]  what's missing, out of range or unreachable (exit 1 if any)
-  deps install [DIR...]                 the commands that install what's missing; runs nothing
+  deps install [-n] [DIR...]            as the user (never root): installs the missing pips (--user),
+                                        then says which host packages are left for the --sudo run
+  sudo deps install --sudo [-n] [DIR...]  as root only: installs the missing host packages (dnf/apt)
+                                        -n: print the commands, run nothing
   deps hosts   [DIR...]                 every network host needed, and whether it answers
 
 A DIR is a project's checkout, holding .coworker/deps.json. The coworker home's own deps.json
-(installed by install.sh) always counts too; with no DIR it is the only one.
+(installed by install.sh) always counts too. Each DIR is remembered in $COWORKER_HOME/projects/
+(<project> holds its path), so with no DIR every project the machine has seen counts.
 Standard library only. COWORKER_PYTHON names the Python whose pips count (python3); COWORKER_PLATFORM,
 COWORKER_FAMILY, COWORKER_TLS_CA and COWORKER_NET_TIMEOUT stand in for the machine's in tests.
 """
@@ -25,9 +29,25 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-HOME = os.environ.get("COWORKER_HOME") or os.path.join(os.path.expanduser("~"), "coworker")
+def euid():
+    return int(os.environ.get("COWORKER_EUID", os.geteuid()))
+
+
+def coworker_home():
+    """$COWORKER_HOME, else ~/coworker; under sudo (which resets HOME and drops COWORKER_HOME), the
+    invoking user's ~/coworker, so root sees the same projects."""
+    if os.environ.get("COWORKER_HOME"):
+        return os.environ["COWORKER_HOME"]
+    if euid() == 0 and os.environ.get("SUDO_USER"):
+        import pwd
+        return os.path.join(pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir, "coworker")
+    return os.path.join(os.path.expanduser("~"), "coworker")
+
+
+HOME = coworker_home()
 PYTHON = os.environ.get("COWORKER_PYTHON", "python3")
-USAGE = "usage: deps check [--no-network] [DIR...] | install [DIR...] | hosts [DIR...]"
+USAGE = "usage: deps check [--no-network] [DIR...] | install [-n] [DIR...] | install --sudo [-n] [DIR...] (as root) | hosts [DIR...]"
+SUDO_HINT = "sudo ~/coworker/bin/deps install --sudo"
 KEYS = {"host": "package", "pips": "pip", "network": "host"}
 ENTRY_KEYS = {"platform", "min", "max", "pin", "why", "port", "probe"}
 
@@ -242,16 +262,53 @@ def load(folder):
     return data
 
 
+def remember(folder, project):
+    """Record a project's checkout in $COWORKER_HOME/projects/<project>, so a run with no DIR finds it."""
+    d = os.path.join(HOME, "projects")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, project)
+    try:
+        with open(path) as f:
+            if f.read().strip() == folder:
+                return
+    except FileNotFoundError:
+        pass
+    with open(path + ".new", "w") as f:
+        f.write(folder + "\n")
+    os.replace(path + ".new", path)
+
+
+def remembered():
+    """The checkouts in $COWORKER_HOME/projects/ that still hold a deps.json (others: said on stderr)."""
+    d = os.path.join(HOME, "projects")
+    out = []
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if name.endswith(".new"):
+            continue
+        with open(os.path.join(d, name)) as f:
+            folder = f.read().strip()
+        if os.path.exists(os.path.join(folder, ".coworker", "deps.json")):
+            out.append(folder)
+        else:
+            print(f"deps: {name}: {folder} has no .coworker/deps.json now; skipped (remove "
+                  f"{os.path.join(d, name)} if the project is gone)", file=sys.stderr)
+    return out
+
+
 def folders(args):
-    """(folder, label) to read, each once: the coworker home's own, then the DIRs."""
+    """(folder, label) to read, each once: the coworker home's own, then the DIRs (or, with none,
+    every remembered project)."""
     candidates = [(HOME, "coworker")] if os.path.exists(os.path.join(HOME, ".coworker", "deps.json")) else []
-    candidates += [(d, None) for d in args]
+    candidates += [(d, None) for d in (args or remembered())]
     out, seen = [], set()
     for f, label in candidates:
         f = os.path.abspath(f)
         if f not in seen:
             seen.add(f)
-            out.append((f, label or load(f).get("project") or os.path.basename(f)))
+            label = label or load(f).get("project") or os.path.basename(f)
+            if f != os.path.abspath(HOME) and euid() != 0:      # root writes nothing in the user's home
+                remember(f, label)
+            out.append((f, label))
     return out
 
 
@@ -303,9 +360,11 @@ class _Key:
 
 # -- the commands -------------------------------------------------------------------------------
 
-def survey(args, network=True):
+def survey(args, network=True, pips=True):
     """[(kind, name, want, state, problem)] where problem is None when all is well."""
     w, fam = wanted(args), family()
+    if not pips:
+        w["pips"] = {}
     rows = []
     vercmp = rpmvercmp if fam == "rpm" else debvercmp
     for name, want in sorted(w["host"].items()):
@@ -322,14 +381,15 @@ def survey(args, network=True):
             results = list(pool.map(lambda n: answers(n.rsplit(":", 1)[0], int(n.rsplit(":", 1)[1]),
                                                       w["network"][n]["probe"]), names))
         for name, (ok, how) in zip(names, results):
-            rows.append(("net", name, w["network"][name], how, None if ok else "unreachable"))
+            problem = None if ok else "certificate" if how.startswith("TLS certificate") else "unreachable"
+            rows.append(("net", name, w["network"][name], how, problem))
     return rows
 
 
 def show(rows):
     for kind, name, want, state, problem in rows:
         label = name + (" " + spec_text(want) if spec_text(want) else "")
-        mark = "ok" if problem is None else problem.upper() if problem in ("missing", "unreachable") else problem
+        mark = "ok" if problem is None else problem.upper() if problem in ("missing", "unreachable", "certificate") else problem
         print(f"  {kind:<4} {label:<40} {state:<22} {mark:<12} {'; '.join(want['why'])}  [{', '.join(want['from'])}]")
 
 
@@ -345,42 +405,101 @@ def check(args):
     return 1 if bad else 0
 
 
-def install(args):
-    rows = [r for r in survey(args, network=False) if r[4]]
+def host_command(rows):
+    """[argv] for the host packages rows say are missing or out of range: one dnf/apt-get, run as root."""
     fam = family()
-    host = [r for r in rows if r[0] == "host"]
-    pips = [r for r in rows if r[0] == "pip"]
-    if not rows:
-        print("# nothing to install")
+    specs = []
+    for kind, name, want, _, problem in rows:
+        if kind != "host" or not problem:
+            continue
+        if "pin" in want:
+            specs.append(f"{name}-{want['pin']}" if fam == "rpm" else f"{name}={want['pin']}")
+        elif fam == "rpm" and "min" in want:
+            specs.append(f"{name} >= {want['min']}")
+        elif fam == "rpm" and "max" in want:
+            specs.append(f"{name} <= {want['max']}")
+        else:
+            specs.append(name)
+        if problem.startswith("above"):
+            print(f"# {name} is {problem}: dnf/apt won't downgrade it by itself")
+    if not specs:
+        return []
+    return [["dnf", "install", "-y", *specs] if fam == "rpm" else ["apt-get", "install", "-y", *specs]]
+
+
+def pip_commands(rows):
+    """[argv] for the pips rows say are missing or out of range, into the user's site."""
+    pips = [r for r in rows if r[0] == "pip" and r[4]]
+    if not pips:
+        return []
+    out = [] if has_pip() else [[PYTHON, "-m", "ensurepip", "--user"]]
+    return out + [[PYTHON, "-m", "pip", "install", "--user", *(n + spec_text(w) for _, n, w, _, _ in pips)]]
+
+
+def run_all(cmds, dry):
+    for argv in cmds:
+        print(("" if dry else "+ ") + " ".join(shlex.quote(a) for a in argv), flush=True)
+        if dry:
+            continue
+        r = subprocess.run(argv)
+        if r.returncode != 0:
+            print(f"deps: that failed (exit {r.returncode}); nothing after it was run", file=sys.stderr)
+            return False
+    return True
+
+
+def install(args):
+    sudo, dry = "--sudo" in args, "-n" in args
+    args = [a for a in args if a not in ("--sudo", "-n")]
+    if sudo and euid() != 0:
+        print(f"deps: install --sudo installs host packages and must run as root: {SUDO_HINT}", file=sys.stderr)
+        return 2
+    if not sudo and euid() == 0:
+        print("deps: install runs as the user (the pips go in the user's site); as root, use --sudo", file=sys.stderr)
+        return 2
+    if sudo:        # root: the host packages only
+        cmds = host_command(survey(args, network=False, pips=False))
+        if not cmds:
+            print("# no host packages to install")
+            return 0
+        if not run_all(cmds, dry):
+            return 1
+        if dry:
+            return 0
+        left = [r for r in survey(args, network=False, pips=False) if r[4]]
+        if left:
+            print("still to fix after the install:")
+            show(left)
+            return 1
+        print("host packages installed")
         return 0
-    if host:
-        specs = []
-        for _, name, want, _, problem in host:
-            if "pin" in want:
-                specs.append(f"{name}-{want['pin']}" if fam == "rpm" else f"{name}={want['pin']}")
-            elif fam == "rpm" and "min" in want:
-                specs.append(f"{name} >= {want['min']}")
-            elif fam == "rpm" and "max" in want:
-                specs.append(f"{name} <= {want['max']}")
-            else:
-                specs.append(name)
-            if problem and problem.startswith("above"):
-                print(f"# {name} is {problem}: dnf/apt won't downgrade it by itself")
-        tool = "dnf install -y" if fam == "rpm" else "apt-get install -y"
-        print(f"sudo {tool} " + " ".join(shlex.quote(s) for s in specs))
-    if pips:
-        if not has_pip():
-            print(f"{PYTHON} -m ensurepip --user")
-        specs = [shlex.quote(name + spec_text(want)) for _, name, want, _, _ in pips]
-        print(f"{PYTHON} -m pip install --user " + " ".join(specs))
-    return 0
+    rows = survey(args, network=False)
+    if not run_all(pip_commands(rows), dry):
+        return 1
+    if dry:
+        for argv in host_command(rows):
+            print("# as root (" + SUDO_HINT + "): " + " ".join(shlex.quote(a) for a in argv))
+        return 0
+    left = [r for r in survey(args, network=False) if r[4]]
+    if not left:
+        print("everything installed")
+        return 0
+    host_left = [r for r in left if r[0] == "host"]
+    if host_left:
+        print(f"{len(host_left)} host package(s) need root: the machine's owner runs\n    {SUDO_HINT}")
+    rest = [r for r in left if r[0] != "host"]
+    if rest:
+        print("still to fix:")
+        show(rest)
+    return 1
 
 
 def hosts(args):
     rows = survey(args, network=True)
     rows = [r for r in rows if r[0] == "net"]
     for _, name, want, state, problem in rows:
-        print(f"{name:<44} {'ok' if problem is None else 'UNREACHABLE':<12} {state:<26} {'; '.join(want['why'])}  [{', '.join(want['from'])}]")
+        mark = {None: "ok", "certificate": "CERTIFICATE"}.get(problem, "BLOCKED")
+        print(f"{name:<44} {mark:<12} {state:<26} {'; '.join(want['why'])}  [{', '.join(want['from'])}]")
     return 1 if any(r[4] for r in rows) else 0
 
 
