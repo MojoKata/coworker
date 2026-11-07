@@ -1,21 +1,106 @@
 {
   "host": [
-    { "package": "util-linux", "why": "flock: the VM lock and the download lock" },
-    { "package": "curl", "why": "downloads fetch" },
-    { "package": "python3", "min": "3.9", "why": "deps runs on it" },
-    { "package": "openssh-clients", "platform": "rocky*", "why": "ssh and scp to the shared VMs" },
-    { "package": "openssh-client", "platform": "debian*", "why": "ssh and scp to the shared VMs" },
-    { "package": "openssh-client", "platform": "ubuntu*", "why": "ssh and scp to the shared VMs" }
+    {
+      "package": "util-linux",
+      "why": "flock: the VM lock and the download lock"
+    },
+    {
+      "package": "curl",
+      "why": "downloads fetch"
+    },
+    {
+      "package": "python3",
+      "min": "3.9",
+      "why": "deps runs on it"
+    },
+    {
+      "package": "openssh-clients",
+      "platform": "rocky*",
+      "why": "ssh and scp to the shared VMs"
+    },
+    {
+      "package": "openssh-client",
+      "platform": "debian*",
+      "why": "ssh and scp to the shared VMs"
+    },
+    {
+      "package": "openssh-client",
+      "platform": "ubuntu*",
+      "why": "ssh and scp to the shared VMs"
+    }
   ],
   "network": [
-    { "host": "github.com", "why": "this repository, and the projects' own" },
-    { "host": "dl.rockylinux.org", "platform": "rocky*", "why": "dnf: Rocky's main server, when the mirrors it is handed don't answer" },
-    { "host": "mirrors.rockylinux.org", "platform": "rocky*", "why": "dnf: the list of mirrors" },
-    { "host": "download.docker.com", "why": "Docker's own package repository" },
-    { "host": "registry-1.docker.io", "why": "Docker Hub: images (curlimages/curl for downloads fetch, the VMs' images)" },
-    { "host": "auth.docker.io", "why": "Docker Hub: sign-in tokens for pulls" },
-    { "host": "production.cloudflare.docker.com", "why": "Docker Hub: image layers" },
-    { "host": "pypi.org", "why": "pip install --user of the pips a deps.json names" },
-    { "host": "files.pythonhosted.org", "why": "pip: the packages themselves" }
+    {
+      "host": "github.com",
+      "why": "this repository, and the projects' own"
+    },
+    {
+      "host": "dl.rockylinux.org",
+      "platform": "rocky*",
+      "why": "dnf: Rocky's main server, when the mirrors it is handed don't answer"
+    },
+    {
+      "host": "mirrors.rockylinux.org",
+      "platform": "rocky*",
+      "why": "dnf: the list of mirrors"
+    },
+    {
+      "host": "download.docker.com",
+      "why": "Docker's own package repository"
+    },
+    {
+      "host": "registry-1.docker.io",
+      "why": "Docker Hub: images (curlimages/curl for downloads fetch, the VMs' images)"
+    },
+    {
+      "host": "auth.docker.io",
+      "why": "Docker Hub: sign-in tokens for pulls"
+    },
+    {
+      "host": "production.cloudflare.docker.com",
+      "why": "Docker Hub: image layers"
+    },
+    {
+      "host": "pypi.org",
+      "why": "pip install --user of the pips a deps.json names"
+    },
+    {
+      "host": "files.pythonhosted.org",
+      "why": "pip: the packages themselves"
+    },
+    {
+      "host": "www.microsoft.com",
+      "why": "vms create win10: dockurr asks Microsoft's download page for the Windows 10 ISO (unless downloads/ holds win10x64.iso)"
+    },
+    {
+      "host": "vlscppe.microsoft.com",
+      "why": "vms create win10: the download page's session check, before it hands out an ISO link"
+    },
+    {
+      "host": "software.download.prss.microsoft.com",
+      "why": "vms create win10: the Windows 10 ISO itself"
+    },
+    {
+      "host": "software-static.download.prss.microsoft.com",
+      "why": "vms create win10: the Windows 10 ISO itself (another of its hosts)"
+    },
+    {
+      "host": "fe3.delivery.mp.microsoft.com",
+      "probe": "tcp",
+      "why": "vms update: Windows Update in the guest (its certificate chains to Microsoft's own root, which the host doesn't carry)"
+    },
+    {
+      "host": "download.windowsupdate.com",
+      "port": 80,
+      "why": "vms update: the updates themselves, over HTTP"
+    },
+    {
+      "host": "download.microsoft.com",
+      "why": "vms update: updates Windows Update fetches from Microsoft's download servers"
+    },
+    {
+      "host": "definitionupdates.microsoft.com",
+      "why": "vms update: Microsoft Defender's definition updates, which Windows Update offers too"
+    }
   ]
 }

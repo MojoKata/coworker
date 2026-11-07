@@ -326,7 +326,11 @@ update_rounds() { # Windows Update as SYSTEM (update.ps1), rebooting as it asks,
 update() {
     [ $# -ge 1 ] || usage
     VM=$(basename "$1")
-    [ -f "$DIR/$VM/update.ps1" ] || { echo "vms: $DIR/$VM has no update.ps1: build it with vms create (README.md, \"VM recipes\")" >&2; exit 1; }
+    [ -f "$DIR/$VM/vm.env" ] || { echo "vms: no $DIR/$VM/vm.env (README.md, \"vm.env\")" >&2; exit 1; }
+    if [ -f "$RECIPES/$VM/update.ps1" ]; then          # the recipe's, also for a VM vms create didn't build
+        install -m 644 "$RECIPES/$VM/update.ps1" "$DIR/$VM/update.ps1"
+    fi
+    [ -f "$DIR/$VM/update.ps1" ] || { echo "vms: no update.ps1 for $VM: it has no recipe (README.md, \"VM recipes\")" >&2; exit 1; }
     lock "$VM" coworker -- update_locked
 }
 
