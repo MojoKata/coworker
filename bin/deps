@@ -530,8 +530,10 @@ def install(args):
     sudo, dry = "--sudo" in args, "-n" in args or "--dry-run" in args
     args = [a for a in args if a not in ("--sudo", "-n", "--dry-run")]
     if sudo and euid() != 0:
-        print(f"deps: install --sudo installs host packages and must run as root: {SUDO_HINT}", file=sys.stderr)
-        return 2
+        if not dry:
+            print(f"deps: install --sudo installs host packages and must run as root: {SUDO_HINT}", file=sys.stderr)
+            return 2
+        print(f"# not root: the real run must be: {SUDO_HINT}", file=sys.stderr)
     if not sudo and euid() == 0:
         print("deps: install runs as the user (the pips go in the user's site); as root, use --sudo", file=sys.stderr)
         return 2

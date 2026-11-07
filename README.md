@@ -228,7 +228,8 @@ packages, which need root and which the machine's owner runs with `sudo`.
 - **`install`** (as the user; it refuses to run as root) installs the missing pips into the user's
   site (`pip install --user`, after `ensurepip --user` when the Python has no pip), checks again, and
   says which host packages are left for the `--sudo` run. Exit 0 only when nothing is left.
-- **`install --sudo`** (as root; it refuses otherwise) installs the missing host packages with one
+- **`install --sudo`** (as root; it refuses otherwise, except with `--dry-run`, which says so on
+  stderr and prints the commands anyway) installs the missing host packages with one
   `dnf install` (or `apt-get install`), checks them again, and writes nothing in the user's home.
   Under `sudo`, which resets `HOME`, it finds the invoking user's coworker home through `SUDO_USER`.
 - **`--dry-run`** (`-n`) prints the commands that half would run, one per line on stdout, and runs

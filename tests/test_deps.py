@@ -245,6 +245,13 @@ class Install(Case):
         self.assertIn("must run as root", self.deps("install", "--sudo", p, rc=2).stderr)
         self.assertEqual(self.log(), [])
 
+    def test_a_sudo_dry_run_as_the_user_notes_it_and_still_prints_the_commands(self):
+        p = self.project("one", {"host": [{"package": "a", "min": "1.2", "why": "w"}]})
+        res = self.deps("install", "--sudo", "--dry-run", p, rc=0)
+        self.assertEqual(res.stdout.strip(), "dnf install -y 'a >= 1.2'")
+        self.assertIn("# not root: the real run must be: sudo ~/coworker/bin/deps install --sudo", res.stderr)
+        self.assertEqual(self.log(), [])
+
     def test_sudo_mode_installs_host_packages_with_ranges_and_pins_then_checks(self):
         p = self.project("one", {"host": [{"package": "a", "min": "1.2", "why": "w"}, {"package": "b", "pin": "9.9", "why": "w"},
                                           {"package": "c", "max": "10", "why": "w"}, {"package": "ok", "why": "there"}],
