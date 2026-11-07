@@ -378,6 +378,35 @@ class Register(Case):
         self.assertIn("needs a 'why'", self.deps("register", p, rc=2).stderr)
 
 
+class MergeOrder(unittest.TestCase):
+    """How it slipped past: the name rule was tested with the longer name read first, and claims are
+    read in sorted file order, so renaming a claim (fankata -> FanKata) turned a fit into a clash.
+    A merge must give one answer whatever order the claims come in."""
+
+    def test_every_order_of_the_claims_merges_the_same(self):
+        import itertools
+        m = load_module()
+        claims = [("a", {"os": {"family": "windows", "name": "Windows 10 Pro", "version": "22H2", "min": "10.0.19045", "why": "a"}}),
+                  ("b", {"os": {"family": "windows", "name": "Windows 10", "min": "10.0.17763", "why": "b"}}),
+                  ("c", {"os": {"family": "windows", "max": "10.0.19045.9999", "why": "c"}}),
+                  ("d", {})]
+        results = set()
+        for order in itertools.permutations(claims):
+            o = m.merge_os("vm", list(order))
+            results.add(tuple(sorted((k, v) for k, v in o.items() if k not in ("from", "why"))))
+        self.assertEqual(len(results), 1, results)
+        self.assertIn(("name", "Windows 10 Pro"), results.pop())
+
+    def test_a_real_clash_is_a_clash_in_every_order(self):
+        import itertools
+        m = load_module()
+        claims = [("a", {"os": {"family": "windows", "name": "Windows 10 Pro", "why": "a"}}),
+                  ("b", {"os": {"family": "windows", "name": "Windows 11 Pro", "why": "b"}})]
+        for order in itertools.permutations(claims):
+            with self.assertRaises(m.Clash):
+                m.merge_os("vm", list(order))
+
+
 class Network(Case):
     """Local servers: one that speaks TLS, one that answers HTTP, one that accepts and never answers
     (what a firewall that filters by name looks like), and a closed port."""
