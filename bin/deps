@@ -514,9 +514,18 @@ def pip_commands(rows):
     return out + [[PYTHON, "-m", "pip", "install", "--user", *(n + spec_text(w) for _, n, w, _, _ in pips)]]
 
 
+def display(argv):
+    """A command as shell text: the packages of one dnf/apt-get/pip call one per line, with \\."""
+    head = 3 if argv[0] in ("dnf", "apt-get") else 5 if argv[2:4] == ["pip", "install"] else len(argv)
+    words = [shlex.quote(a) for a in argv]
+    if len(argv) - head < 2:
+        return " ".join(words)
+    return " \\\n    ".join([" ".join(words[:head])] + words[head:])
+
+
 def run_all(cmds, dry):
     for argv in cmds:
-        print(("" if dry else "+ ") + " ".join(shlex.quote(a) for a in argv), flush=True)
+        print(("" if dry else "+ ") + display(argv), flush=True)
         if dry:
             continue
         r = subprocess.run(argv)
@@ -559,7 +568,7 @@ def install(args):
     tools = [r for r in rows if r[0] == "tool" and r[4]]
     if dry:     # stdout: only what this run would run; the other halves on stderr
         for argv in host_command(rows):
-            print("# as root (" + SUDO_HINT + "): " + " ".join(shlex.quote(a) for a in argv), file=sys.stderr)
+            print("# as root (" + SUDO_HINT + "):\n# " + display(argv).replace("\n", "\n# "), file=sys.stderr)
         for _, name, want, _, _ in tools:
             print(f"# {name}, by hand: {want['how']}", file=sys.stderr)
         return 0

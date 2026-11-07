@@ -257,7 +257,8 @@ class Install(Case):
                                           {"package": "c", "max": "10", "why": "w"}, {"package": "ok", "why": "there"}],
                                  "pips": [{"pip": "pillow", "why": "the user's, not root's"}]})
         res = self.deps("install", "--sudo", p, rc=0, FAKE_RPMS="ok=1-1", **self.ROOT)
-        self.assertEqual(self.log(), ["dnf install -y a >= 1.2 b-9.9 c <= 10"])
+        self.assertEqual(self.log(), ["dnf install -y a >= 1.2 b-9.9 c <= 10"])          # one dnf call
+        self.assertIn("+ dnf install -y \\\n    'a >= 1.2' \\\n    b-9.9 \\\n    'c <= 10'\n", res.stdout)
         self.assertIn("host packages installed", res.stdout)
         self.assertFalse((self.home / "projects").exists(), "root wrote in the user's coworker home")
 
@@ -274,13 +275,21 @@ class Install(Case):
         self.assertIn("exit 7", res.stderr)
         self.assertIn("nothing after it was run", res.stderr)
 
+    def test_a_dry_run_is_shell_one_package_a_line(self):
+        p = self.project("one", {"host": [{"package": "a", "min": "1.2", "why": "w"}, {"package": "b", "why": "w"}]})
+        out = self.deps("install", "--sudo", "--dry-run", p, rc=0, **self.ROOT).stdout
+        self.assertEqual(out, "dnf install -y \\\n    'a >= 1.2' \\\n    b\n")
+        parsed = subprocess.run(["sh", "-c", "set -- " + out.replace("dnf install -y", "", 1) + '\nprintf "%s|" "$@"'],
+                                capture_output=True, text=True).stdout
+        self.assertEqual(parsed, "a >= 1.2|b|")                                          # the shell reads it back
+
     def test_dry_run_prints_both_parts_and_runs_nothing(self):
         p = self.project("one", {"host": [{"package": "a", "min": "1.2", "why": "w"}],
                                  "pips": [{"pip": "pillow", "min": "13.0.0", "why": "w"}]})
         res = self.deps("install", "--dry-run", p, rc=0)
         py = self.env["COWORKER_PYTHON"]
         self.assertEqual(res.stdout.splitlines(), [f"{py} -m pip install --user 'pillow>=13.0.0'"])
-        self.assertIn("# as root (sudo ~/coworker/bin/deps install --sudo): dnf install -y 'a >= 1.2'", res.stderr)
+        self.assertIn("# as root (sudo ~/coworker/bin/deps install --sudo):\n# dnf install -y 'a >= 1.2'", res.stderr)
         self.assertEqual(self.deps("install", "--sudo", "--dry-run", p, rc=0, **self.ROOT).stdout.strip(), "dnf install -y 'a >= 1.2'")
         self.assertEqual(self.deps("install", "-n", p, rc=0).stdout, res.stdout)        # -n is the short name
         self.assertEqual(self.log(), [])
@@ -289,7 +298,7 @@ class Install(Case):
         p = self.project("one", {"host": [{"package": "libgl1", "why": "w"}, {"package": "b", "pin": "2.0", "why": "w"}]})
         out = self.deps("install", "--sudo", "-n", p, rc=0, COWORKER_FAMILY="deb", COWORKER_PLATFORM="ubuntu-24.04",
                         FAKE_DEBS="", **self.ROOT).stdout
-        self.assertEqual(out.strip(), "apt-get install -y b=2.0 libgl1")
+        self.assertEqual(out.strip(), "apt-get install -y \\\n    b=2.0 \\\n    libgl1")
 
     def test_nothing_missing_says_so(self):
         p = self.project("one", {"host": [{"package": "a", "why": "w"}]})
