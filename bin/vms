@@ -124,7 +124,7 @@ run_() {         # exit: 1 the host lacks a need (deps install), 65 the projects
     done
     [ $# -gt 0 ] || usage
     [ -f "$D/.coworker/deps.json" ] || { echo "vms: no $D/.coworker/deps.json (README.md, \"Dependencies\")" >&2; exit 2; }
-    P=$(basename "$(cd "$D" && pwd)")     # a project's name is its checkout directory's
+    P=$(basename "$(cd "$D" && pwd -P)")  # a project's name is its checkout directory's (the real one)
     "$DEPS" vm-claim "$VM" "$D" || exit $?
     lock "$VM" "$P" $NOWAIT -- run_locked "$@"
 }

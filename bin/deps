@@ -308,7 +308,7 @@ def check_vm(section, where):
 
 def project_name(folder):
     """A project's name is its checkout directory's name: what it claims under and registers as."""
-    name = os.path.basename(os.path.abspath(folder))
+    name = os.path.basename(os.path.realpath(folder))      # through a symlink too: the real directory
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name == "lock":
         raise Bad(f"{folder}: a project's name is its checkout directory's name, which must be letters, "
                   f"digits, - and _ (and not lock)")
@@ -381,7 +381,7 @@ def folders(args):
     candidates += [(d, None) for d in (args or remembered())]
     out, seen = [], set()
     for f, label in candidates:
-        f = os.path.abspath(f)
+        f = os.path.realpath(f)
         if f not in seen:
             seen.add(f)
             if label is None:
@@ -638,7 +638,7 @@ def register(args):
     lacks something the project needs."""
     if len(args) != 1:
         raise Bad("usage: deps register DIR")
-    folder = os.path.abspath(args[0])
+    folder = os.path.realpath(args[0])
     data = load(folder)
     project = project_name(folder)
     if euid() != 0:
@@ -747,7 +747,7 @@ def vm_claim(args):
     if len(args) != 2:
         raise Bad("usage: deps vm-claim VM DIR")
     vm, d = args
-    folder = os.path.abspath(d)
+    folder = os.path.realpath(d)
     data = load(folder)
     project = project_name(folder)
     vf = vm_folder(vm)

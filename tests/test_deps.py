@@ -636,6 +636,14 @@ class VmsRun(Case):
         out = subprocess.run(["sh", VMS, "list"], capture_output=True, text=True, env=self.env).stdout
         self.assertIn("win | Windows 10 Pro 22H2 | claimed by one | free", out)
 
+    def test_through_a_symlink_the_name_is_the_real_directorys(self):
+        real = self.project("RealName", {})
+        os.symlink(real, self.tmp / "oldname")
+        self.run_vm(str(self.tmp / "oldname"), "true", rc=0)
+        self.assertTrue((self.home / "vms" / "win.RealName").exists())
+        self.assertFalse((self.home / "vms" / "win.oldname").exists())
+        self.assertEqual((self.home / "projects" / "RealName").read_text().strip(), os.path.realpath(real))
+
     def test_the_claim_is_named_after_the_checkout_directory(self):
         self.run_vm(self.project("MyProject", {}), "true", rc=0)
         self.assertTrue((self.home / "vms" / "win.MyProject").exists())
