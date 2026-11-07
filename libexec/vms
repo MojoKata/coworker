@@ -323,7 +323,7 @@ lcu() {         # the recipe's last cumulative update (LCU_*), when the guest's 
     echo "$VM: build $b; installing ${LCU_URL##*/} (build $LCU_BUILD)"
     { to_guest "$VM_HOME/install-msu.ps1" && to_guest "$f"; } || return 69
     guest_task coworker-msu msu.result "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\coworker\\install-msu.ps1 C:\\coworker\\${LCU_URL##*/}" || return $?
-    echo "$VM: $res"
+    printf '%s\n' "$VM: $res"
     case $res in
         "DONE exit=0"|"DONE exit=2359302") ;;
         "DONE exit=3010") restart_guest || return $? ;;
@@ -352,8 +352,8 @@ update_rounds() { # the recipe's last cumulative update, then Windows Update as 
             sleep "${COWORKER_VM_POLL:-15}"
             res=$(vssh yes 'Get-Content C:\coworker\update.result -ErrorAction SilentlyContinue' | tr -d '\r' | grep -E '^(DONE|FAILED)' || true)
         done
-        echo "$VM: $res"
-        case $res in FAILED*) echo "vms: $VM: Windows Update failed (C:\coworker\update.log)" >&2; return 1 ;; esac
+        printf '%s\n' "$VM: $res"
+        case $res in FAILED*) printf '%s\n' "vms: $VM: Windows Update failed (C:\coworker\update.log)" >&2; return 1 ;; esac
         set -- $res
         inst=${2#installed=}; bad=${3#failed=}; boot=${4#reboot=}
         if [ "$boot" = 1 ]; then
@@ -364,7 +364,7 @@ update_rounds() { # the recipe's last cumulative update, then Windows Update as 
             continue
         fi
         if [ "$inst" = 0 ]; then
-            [ "$bad" = 0 ] || { echo "vms: $VM: $bad update(s) keep failing to install (C:\coworker\update.log)" >&2; return 1; }
+            [ "$bad" = 0 ] || { printf '%s\n' "vms: $VM: $bad update(s) keep failing to install (C:\coworker\update.log)" >&2; return 1; }
             b=$(guest_build)
             if [ -n "${LCU_BUILD:-}" ] && ! at_least "$b" "$LCU_BUILD"; then
                 echo "vms: $VM: Windows Update has nothing more, but the build is $b, older than the recipe's $LCU_BUILD" >&2

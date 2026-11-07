@@ -29,7 +29,7 @@ esac
 SSH = """#!/bin/sh
 for last; do :; done
 [ -f "$FAKE_UP" ] || { echo "ssh: connect to host: Connection refused" >&2; exit 255; }
-echo "ssh $last" >> "$FAKE_LOG"
+printf 'ssh %s\\n' "$last" >> "$FAKE_LOG"
 case $last in
   "echo up") echo up ;;
   *ssh_host_*) printf 'ssh-ed25519 AAAAguestkey\\r\\n' ;;
