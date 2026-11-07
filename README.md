@@ -459,3 +459,11 @@ Standard library only; they need `sh`, `flock` (util-linux), for `fetch`, `curl`
 network checks, `openssl` (a throwaway certificate). Each test
 uses a throwaway `COWORKER_HOME`, so they never touch the machine's. `tests/test_protocol.py` runs the
 launcher from a project holding a copy of this checkout as its `coworker/`.
+
+## Repository settings
+
+`repo-admin.sh check` reads this repository's GitHub settings back (exit 1 when one differs); `repo-admin.sh
+apply`, run by an admin with `gh` logged in, sets them: a ruleset on `main` (a pull request to
+merge, squash only, no force push or deletion, the `test` check), squash merging only with the branch deleted once merged, the Actions token
+read-only, actions pinned by SHA, fork pull requests' runs approved first, and private vulnerability
+reporting. Each MojoKata repository has the same script; only its settings block differs.
