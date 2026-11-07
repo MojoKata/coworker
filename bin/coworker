@@ -1,0 +1,94 @@
+#!/bin/sh
+# coworker: what a project calls, from its coworker submodule (<checkout>/coworker/bin/...). It
+# checks the installed coworker against this one (the handshake) and hands the call to it; only
+# install runs from here. bin/deps, bin/vms and bin/downloads are this file under those names.
+# README.md, "In a project" and "Protocol".
+#
+#   coworker status [--no-network] [DIR]  the first step on a machine: the handshake, then deps status DIR
+#                                   (DIR: the project this submodule is in)
+#   coworker install [--change]     install this coworker into $COWORKER_HOME (a human's call, or
+#                                   their say-so); --change when the installed one's protocol differs
+#   coworker protocol               this coworker's protocol
+#   coworker deps|vms|downloads ... the installed command, after the handshake (as bin/deps ... is)
+#
+# Exit 3: waiting on a human (not installed, or a protocol that doesn't match), with what to run.
+# COWORKER_UNATTENDED=1 (CI, where there's no human) installs instead of waiting.
+#
+# What this reads of an install is frozen for every protocol, so any launcher meets any install:
+# ${COWORKER_HOME:-~/coworker}, its bin/<command>, and its PROTOCOL (MAJOR.MINOR; none: protocol 3).
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+MINE=$(cat "$ROOT/PROTOCOL")
+if [ -n "${COWORKER_HOME:-}" ]; then H=$COWORKER_HOME
+elif [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then H=$(getent passwd "$SUDO_USER" | cut -d: -f6)/coworker
+else H=$HOME/coworker; fi
+
+cmd=$(basename "$0")
+if [ "$cmd" = coworker ]; then
+    cmd=${1:-}
+    [ $# -gt 0 ] && shift
+fi
+
+installed() {   # the installed protocol; empty when coworker isn't installed in $H
+    if [ -f "$H/PROTOCOL" ]; then cat "$H/PROTOCOL"
+    elif [ -x "$H/bin/deps" ]; then echo 3
+    fi
+}
+fits() {        # fits INSTALLED: same major, and the install's minor at least this one's
+    case $1 in *.*) ;; *) return 1 ;; esac
+    [ "${1%%.*}" = "${MINE%%.*}" ] && [ "${1#*.}" -ge "${MINE#*.}" ]
+}
+projects() {    # the projects the install has seen, each after a space
+    out=""
+    for f in "$H"/projects/*; do [ -f "$f" ] && case $f in *.new) ;; *) out="$out ${f##*/}" ;; esac; done
+    echo "${out:- (none yet)}"
+}
+handshake() {   # handshake COMMAND [ARG]: return when the install fits; else install (unattended) or exit 3
+    have=$(installed)
+    if [ -n "$have" ] && fits "$have"; then return 0; fi
+    if [ "${COWORKER_UNATTENDED:-}" = 1 ]; then
+        sh "$ROOT/install.sh" --change >&2
+        have=$(installed)
+        fits "$have" && return 0
+        echo "coworker: installed $have in $H, and it still doesn't fit this project's $MINE" >&2
+        exit 1
+    fi
+    if [ -z "$have" ]; then
+        if [ "$1 ${2:-}" = "deps register" ]; then  # never fails a script: in a project's own container there's no install
+            echo "coworker: not installed in $H; the project's first step is $ROOT/bin/coworker status" >&2
+            exit 0
+        fi
+        echo "coworker: not installed in $H. Installing it is a human's call (README.md, \"A new machine\"):" >&2
+        echo "    $ROOT/bin/coworker install" >&2
+        exit 3
+    fi
+    echo "coworker: this project's coworker is protocol $MINE; the one installed in $H is $have." >&2
+    echo "The machine's projects ($(projects | sed 's/^ //')) move together, by a human's call (README.md, \"Protocol\"):" >&2
+    echo "    $ROOT/bin/coworker install --change" >&2
+    exit 3
+}
+project_dir() { # the project this submodule is in
+    p=$(git -C "$ROOT" rev-parse --show-superproject-working-tree 2>/dev/null || true)
+    [ -n "$p" ] || p=$(cd "$ROOT/.." && pwd)
+    [ -f "$p/.coworker/deps.json" ] || { echo "coworker: no project around $ROOT: give its checkout (coworker status DIR)" >&2; exit 2; }
+    echo "$p"
+}
+
+case $cmd in
+    install) exec sh "$ROOT/install.sh" "$@" ;;
+    protocol) echo "$MINE"; exit 0 ;;
+    status)
+        flags=""; d=""
+        for a; do case $a in --no-network) flags=$a ;; -*) echo "usage: coworker status [--no-network] [DIR]" >&2; exit 2 ;; *) d=$a ;; esac; done
+        [ -n "$d" ] || d=$(project_dir)
+        handshake status
+        export COWORKER_HOME="$H" COWORKER_CLIENT_PROTOCOL="$MINE"
+        exec "$H/bin/deps" status $flags "$d" ;;
+    deps|vms|downloads)
+        handshake "$cmd" "${1:-}"
+        export COWORKER_HOME="$H" COWORKER_CLIENT_PROTOCOL="$MINE"
+        exec "$H/bin/$cmd" "$@" ;;
+    *)
+        echo "usage: coworker status [--no-network] [DIR] | install [--change] | protocol | deps|vms|downloads ARG..." >&2
+        exit 2 ;;
+esac

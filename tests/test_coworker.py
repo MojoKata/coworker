@@ -12,8 +12,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DOWNLOADS = str(ROOT / "bin" / "downloads")
-VMS = str(ROOT / "bin" / "vms")
+DOWNLOADS = str(ROOT / "libexec" / "downloads")
+VMS = str(ROOT / "libexec" / "vms")
+PROTOCOL = (ROOT / "PROTOCOL").read_text().strip()   # the commands are called as a project's submodule calls them
 
 
 def run(cmd, *args, env, check=True):
@@ -29,12 +30,12 @@ class Case(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
         self.home = self.tmp / "coworker"
-        self.env = {**os.environ, "COWORKER_HOME": str(self.home)}
+        self.env = {**os.environ, "COWORKER_HOME": str(self.home), "COWORKER_CLIENT_PROTOCOL": PROTOCOL}
 
 
 class Home(Case):
     def test_the_home_is_coworker_in_the_users_home_unless_set(self):
-        env = {**os.environ, "HOME": str(self.tmp)}
+        env = {**self.env, "HOME": str(self.tmp)}
         env.pop("COWORKER_HOME", None)
         run(DOWNLOADS, "claim", "x.iso", "one", env=env)
         run(VMS, "claim", "win", "one", env=env)
@@ -47,13 +48,13 @@ class Home(Case):
         for f in ("downloads", "vms", "deps"):
             p = self.home / "bin" / f
             self.assertTrue(p.is_file() and not p.is_symlink() and os.access(p, os.X_OK), f)
-            self.assertEqual(p.read_bytes(), (ROOT / "bin" / f).read_bytes())
+            self.assertEqual(p.read_bytes(), (ROOT / "libexec" / f).read_bytes())
         self.assertTrue((self.home / "VERSION").read_text().strip())
         (self.home / "downloads" / "x.iso").write_text("data")
         (self.home / "vms" / "win").mkdir()
         (self.home / "bin" / "vms").write_text("old")
         subprocess.run(["sh", str(ROOT / "install.sh")], check=True, capture_output=True, env=self.env, timeout=60)
-        self.assertEqual((self.home / "bin" / "vms").read_bytes(), (ROOT / "bin" / "vms").read_bytes())
+        self.assertEqual((self.home / "bin" / "vms").read_bytes(), (ROOT / "libexec" / "vms").read_bytes())
         self.assertEqual((self.home / "downloads" / "x.iso").read_text(), "data")
         self.assertTrue((self.home / "vms" / "win").is_dir())
         self.assertEqual(sorted(os.listdir(self.home / "bin")), ["deps", "downloads", "vms"])
