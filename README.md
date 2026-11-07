@@ -211,7 +211,7 @@ Maintenance:
 ## Dependencies
 
 Each project says in its own `.coworker/deps.json` what the machine must have for it: host packages,
-pips in the system Python, and network hosts it reaches. `deps` reads those files, and coworker's
+pips in the system Python, tools from their own installers, and network hosts it reaches. `deps` reads those files, and coworker's
 own, and says what's missing, installs it, and lists the hosts for the machine's firewall. The
 install has two halves: what the user can install (the pips), which an agent runs, and the host
 packages, which need root and which the machine's owner runs with `sudo`.
@@ -278,6 +278,7 @@ checkout that's gone is skipped and said; delete its file when the project is.
 | `project` | the project's name (as it claims things); labels its needs in the output |
 | `host` | host packages: `package` is the distribution's name for it (`dnf`/`apt`) |
 | `pips` | pips in the system Python (`python3`): `pip` is the distribution name (`pillow`, not `PIL`) |
+| `tools` | what comes from its own installer, not the package manager (an SDK, Nix): `tool`, found by `command` (on `PATH`) or `path` (`~` allowed), and `how` to install it, which `deps install` prints and never runs |
 | `network` | hosts it reaches: `host`, `port` (443), `probe` (how it's tried: `tls`, or `http` on port 80; `tcp` for anything else) |
 | `platform` | which machines an entry is for: a glob over `ID-VERSION_ID` from `/etc/os-release` (`rocky-10.2`, `ubuntu-24.04`); every machine if left out |
 | `min`, `max` | the versions it accepts, inclusive; `pin`, exactly one (not with `min` or `max`) |

@@ -183,6 +183,36 @@ class Check(Case):
         self.assertIn("usage: deps", self.deps("frob", rc=2).stderr)
 
 
+class Tools(Case):
+    def test_a_tool_is_found_by_command_or_path_and_its_how_is_only_printed(self):
+        (self.tmp / "sdk").mkdir()
+        p = self.project("one", {"tools": [
+            {"tool": "shell", "command": "sh", "how": "it comes with the system", "why": "w"},
+            {"tool": "sdk", "path": str(self.tmp / "sdk"), "how": "unpack the sdk", "why": "w"},
+            {"tool": "nix", "command": "no-such-command-here", "how": "curl -L https://nixos.org/nix/install | sh", "why": "builds"},
+            {"tool": "android", "path": "~/no/such/android-sdk", "how": "sdkmanager platforms;android-34", "why": "w"}]})
+        out = self.deps("check", "--no-network", p, rc=1).stdout
+        self.assertIn("ok", self.line(out, "shell"))
+        self.assertIn("ok", self.line(out, "sdk"))
+        self.assertIn("MISSING", self.line(out, "nix"))
+        self.assertIn("MISSING", self.line(out, "android"))
+        res = self.deps("install", p, rc=1)
+        self.assertIn("2 tool(s) come from their own installers, which deps never runs", res.stdout)
+        self.assertIn("nix: curl -L https://nixos.org/nix/install | sh", res.stdout)
+        self.assertEqual(self.log(), [])
+
+    def test_a_tool_needs_one_way_to_find_it_and_a_how(self):
+        for bad, said in (({"tools": [{"tool": "t", "why": "w", "how": "h"}]}, "a command or a path (one)"),
+                          ({"tools": [{"tool": "t", "why": "w", "how": "h", "command": "c", "path": "p"}]}, "(one)"),
+                          ({"tools": [{"tool": "t", "why": "w", "command": "c"}]}, "needs 'how'"),
+                          ({"host": [{"package": "a", "why": "w", "how": "h"}]}, "are a tool's")):
+            self.assertIn(said, self.deps("check", "--no-network", self.project("bad", bad), rc=2).stderr, bad)
+
+    def log(self):
+        f = self.tmp / "log"
+        return f.read_text().splitlines() if f.exists() else []
+
+
 class Install(Case):
     ROOT = {"COWORKER_EUID": "0"}
 

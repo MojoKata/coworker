@@ -55,8 +55,8 @@ USAGE = ("usage: deps check [--no-network] [DIR...] | install [-n] [DIR...] | in
          " | hosts [DIR...] | register DIR | vm-claim VM DIR | vm-guest VM [--wait SECONDS]")
 SSH = os.environ.get("COWORKER_SSH", "ssh")
 SUDO_HINT = "sudo ~/coworker/bin/deps install --sudo"
-KEYS = {"host": "package", "pips": "pip", "network": "host"}
-ENTRY_KEYS = {"platform", "min", "max", "pin", "why", "port", "probe"}
+KEYS = {"host": "package", "pips": "pip", "network": "host", "tools": "tool"}
+ENTRY_KEYS = {"platform", "min", "max", "pin", "why", "port", "probe", "command", "path", "how"}
 
 
 class Bad(Exception):
@@ -261,7 +261,16 @@ def check_lists(data, path):
                 raise Bad(f"{where} ({e[name_key]}): a pin with a min or max")
             if kind == "network" and set(e) & {"min", "max", "pin"}:
                 raise Bad(f"{where} ({e[name_key]}): a host has no version")
-            if kind != "network" and set(e) & {"port", "probe"}:
+            if kind == "tools":
+                if set(e) & {"min", "max", "pin", "port", "probe"}:
+                    raise Bad(f"{where} ({e[name_key]}): a tool is checked by its command or path only")
+                if ("command" in e) == ("path" in e):
+                    raise Bad(f"{where} ({e[name_key]}): a tool needs a command or a path (one)")
+                if not isinstance(e.get("how"), str) or not e["how"].strip():
+                    raise Bad(f"{where} ({e[name_key]}): a tool needs 'how': how to install it")
+            elif set(e) & {"command", "path", "how"}:
+                raise Bad(f"{where} ({e[name_key]}): command, path and how are a tool's")
+            if kind not in ("network", "tools") and set(e) & {"port", "probe"}:
                 raise Bad(f"{where} ({e[name_key]}): only a network host has a port or probe")
             if e.get("probe", "tls") not in ("tls", "http", "tcp"):
                 raise Bad(f"{where} ({e[name_key]}): probe is tls, http or tcp")
@@ -273,7 +282,7 @@ def check_vm(section, where):
         raise Bad(f"{where}: a VM's needs are an object")
     for k in section:
         if k not in KEYS and k != "os":
-            raise Bad(f"{where}: unknown key {k!r} (os, host, pips, network)")
+            raise Bad(f"{where}: unknown key {k!r} (os, host, pips, network, tools)")
     check_lists(section, where)
     o = section.get("os")
     if o is None:
@@ -304,7 +313,7 @@ def load(folder):
         raise Bad(f"{path}: not a JSON object")
     for k in data:
         if k not in KEYS and k not in ("project", "vms"):
-            raise Bad(f"{path}: unknown key {k!r} (project, host, pips, network, vms)")
+            raise Bad(f"{path}: unknown key {k!r} (project, host, pips, network, tools, vms)")
     check_lists(data, path)
     vms = data.get("vms", {})
     if not isinstance(vms, dict):
@@ -383,6 +392,11 @@ def wanted_from(sources):
                     continue
                 taken.add(name)
                 w = out[kind].setdefault(name, {"from": [], "why": []})
+                if kind == "tools":
+                    probe = ("command", e["command"]) if "command" in e else ("path", e["path"])
+                    if w.setdefault("probe", probe) != probe:
+                        raise Clash(f"{name}: found as {w['probe'][1]} and as {probe[1]} ({', '.join(w['from'])})")
+                    w.setdefault("how", e["how"])
                 if kind == "network":
                     probe = e.get("probe", default_probe(e.get("port", 443)))
                     if w.setdefault("probe", probe) != probe:
@@ -435,6 +449,10 @@ def survey_from(w, network=True, pips=True):
         have = installed_pip(name)
         rows.append(("pip", name, want, have or "not installed",
                      "missing" if have is None else in_range(have, want, pipvercmp)))
+    for name, want in sorted(w["tools"].items()):
+        how, where = want["probe"]
+        found = shutil.which(where) if how == "command" else (os.path.expanduser(where) if os.path.exists(os.path.expanduser(where)) else None)
+        rows.append(("tool", name, want, found or f"no {where}", None if found else "missing"))
     if network and w["network"]:
         names = sorted(w["network"])
         with ThreadPoolExecutor(16) as pool:
@@ -536,18 +554,25 @@ def install(args):
     rows = survey(args, network=False)
     if not run_all(pip_commands(rows), dry):
         return 1
+    tools = [r for r in rows if r[0] == "tool" and r[4]]
     if dry:
         for argv in host_command(rows):
             print("# as root (" + SUDO_HINT + "): " + " ".join(shlex.quote(a) for a in argv))
+        for _, name, want, _, _ in tools:
+            print(f"# {name}, by hand: {want['how']}")
         return 0
     left = [r for r in survey(args, network=False) if r[4]]
     if not left:
         print("everything installed")
         return 0
+    if tools:
+        print(f"{len(tools)} tool(s) come from their own installers, which deps never runs:")
+        for _, name, want, _, _ in tools:
+            print(f"  {name}: {want['how']}    # {'; '.join(want['why'])}")
     host_left = [r for r in left if r[0] == "host"]
     if host_left:
         print(f"{len(host_left)} host package(s) need root: the machine's owner runs\n    {SUDO_HINT}")
-    rest = [r for r in left if r[0] != "host"]
+    rest = [r for r in left if r[0] not in ("host", "tool")]
     if rest:
         print("still to fix:")
         show(rest)
