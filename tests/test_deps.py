@@ -262,6 +262,24 @@ class Install(Case):
         self.assertIn("host packages installed", res.stdout)
         self.assertFalse((self.home / "projects").exists(), "root wrote in the user's coworker home")
 
+    def test_sudo_mode_rechecks_host_packages_only(self):
+        p = self.project("one", {"host": [{"package": "a", "why": "w"}],
+                                 "tools": [{"tool": "sdk", "path": "~/no-such-sdk", "how": "h", "why": "the user's"}],
+                                 "pips": [{"pip": "pillow", "why": "the user's"}]})
+        res = self.deps("install", "--sudo", p, rc=0, **self.ROOT)
+        self.assertIn("host packages installed", res.stdout)
+        self.assertNotIn("sdk", res.stdout)
+
+    def test_a_tools_tilde_is_the_coworker_homes_owners_home(self):
+        import pwd
+        mine = pwd.getpwuid(os.getuid()).pw_dir
+        self.home.mkdir(parents=True, exist_ok=True)
+        code = ("import importlib.machinery as m, importlib.util as u; l = m.SourceFileLoader('d', %r); "
+                "s = u.spec_from_loader('d', l); d = u.module_from_spec(s); l.exec_module(d); print(d.user_path('~/sdk'))") % DEPS
+        out = subprocess.run(["python3", "-c", code], capture_output=True, text=True,
+                             env={**self.env, "HOME": "/root"}).stdout.strip()
+        self.assertEqual(out, os.path.join(mine, "sdk"))
+
     def test_sudo_mode_says_what_is_still_wrong_after(self):
         p = self.project("one", {"host": [{"package": "a", "min": "10", "why": "w"}]})
         res = self.deps("install", "--sudo", p, rc=1, **self.ROOT)      # the stand-in installs 9.9

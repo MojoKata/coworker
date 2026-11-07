@@ -436,15 +436,29 @@ class _Key:
 
 # -- the commands -------------------------------------------------------------------------------
 
-def survey(args, network=True, pips=True):
-    return survey_from(wanted(args), network, pips)
+def survey(args, network=True, pips=True, tools=True):
+    return survey_from(wanted(args), network, pips, tools)
 
 
-def survey_from(w, network=True, pips=True):
+def user_path(p):
+    """A tool's path with ~ as the home of whoever owns the coworker home: under sudo or a root login
+    ~ would be root's, and the tools are the user's."""
+    if p.startswith("~"):
+        try:
+            import pwd
+            return pwd.getpwuid(os.stat(HOME).st_uid).pw_dir + p[1:]
+        except (OSError, KeyError):
+            pass
+    return os.path.expanduser(p)
+
+
+def survey_from(w, network=True, pips=True, tools=True):
     """[(kind, name, want, state, problem)] where problem is None when all is well."""
     fam = family()
     if not pips:
         w["pips"] = {}
+    if not tools:
+        w["tools"] = {}
     rows = []
     vercmp = rpmvercmp if fam == "rpm" else debvercmp
     for name, want in sorted(w["host"].items()):
@@ -457,7 +471,7 @@ def survey_from(w, network=True, pips=True):
                      "missing" if have is None else in_range(have, want, pipvercmp)))
     for name, want in sorted(w["tools"].items()):
         how, where = want["probe"]
-        found = shutil.which(where) if how == "command" else (os.path.expanduser(where) if os.path.exists(os.path.expanduser(where)) else None)
+        found = shutil.which(where) if how == "command" else (user_path(where) if os.path.exists(user_path(where)) else None)
         rows.append(("tool", name, want, found or f"no {where}", None if found else "missing"))
     if network and w["network"]:
         names = sorted(w["network"])
@@ -553,7 +567,7 @@ def install(args):
         print("deps: install runs as the user (the pips go in the user's site); as root, use --sudo", file=sys.stderr)
         return 2
     if sudo:        # root: the host packages only
-        cmds = host_command(survey(args, network=False, pips=False))
+        cmds = host_command(survey(args, network=False, pips=False, tools=False))
         if not cmds:
             print("# no host packages to install", file=sys.stderr)
             return 0
@@ -561,7 +575,7 @@ def install(args):
             return 1
         if dry:
             return 0
-        left = [r for r in survey(args, network=False, pips=False) if r[4]]
+        left = [r for r in survey(args, network=False, pips=False, tools=False) if r[4]]
         if left:
             print("still to fix after the install:")
             show(left)
