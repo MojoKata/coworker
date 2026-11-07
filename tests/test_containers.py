@@ -92,28 +92,45 @@ class Images(Case):
         d = self.project("bad", {"vms": {"win10": {"container_images": [{"image": "x:1", "why": "w"}]}}})
         self.deps("check", "--no-network", d, rc=2)
 
-    def test_check_reports_a_missing_pulled_image_and_install_pulls_it(self):
+    def test_check_says_a_pulled_image_isnt_here_without_failing_and_install_pulls_it(self):
         self.images(img(1, [f"ubuntu:22.04"], [f"ubuntu@{D1}"]))
-        out = self.deps("check", "--no-network", self.b, rc=1).stdout
-        self.assertIn("MISSING", self.line(out, "tobix/pywine:3.12"))
-        self.assertNotIn("MISSING", self.line(out, f"ubuntu:22.04@{D1}"))
+        out = self.deps("check", "--no-network", self.b, rc=0).stdout     # docker pulls it on first use
+        self.assertIn("not here (pulled on first use)", self.line(out, "tobix/pywine:3.12"))
+        self.assertIn("here", self.line(out, f"ubuntu:22.04@{D1}"))
         self.deps("install", self.b)
         self.assertIn("docker pull tobix/pywine:3.12", Path(self.env["FAKE_LOG"]).read_text())
-        self.assertNotIn("MISSING", self.deps("check", "--no-network", self.b).stdout)
+        self.assertNotIn("docker pull ubuntu", Path(self.env["FAKE_LOG"]).read_text())
+
+    def test_no_docker_is_a_problem_when_a_project_declares_images(self):
+        res = self.deps("check", "--no-network", self.b, rc=1, COWORKER_DOCKER="no-such-docker")
+        self.assertIn("no docker", self.line(res.stdout, "tobix/pywine:3.12"))
 
     def test_a_built_image_not_built_yet_is_no_problem_and_its_base_is_claimed(self):
         self.images(img(1, [f"ubuntu:22.04"], [f"ubuntu@{D1}"]))
-        out = self.deps("check", "--no-network", self.a, rc=1).stdout
+        out = self.deps("check", "--no-network", self.a, rc=0).stdout
         self.assertIn("not built yet (scripts/build.sh)", self.line(out, "one-build"))
-        self.assertIn("MISSING", self.line(out, f"ubuntu:24.04@{D2}"))     # the base, claimed by one
+        self.assertIn("not here", self.line(out, f"ubuntu:24.04@{D2}"))    # the base, claimed by one
 
-    def test_status_pulls_what_is_missing_by_itself(self):
+    def test_a_built_image_as_anothers_base_is_never_pulled(self):
+        d = self.project("three", {"container_images": [
+            {"image": "three-base", "built": "b.sh", "from": [f"ubuntu:24.04@{D2}"], "why": "w"},
+            {"image": "three-top", "built": "b.sh", "from": ["three-base:latest"], "why": "w"}]})
         self.images()
-        env = {k: v for k, v in self.env.items()}
+        out = self.deps("check", "--no-network", d, rc=0).stdout
+        self.assertNotIn("three-base:latest", out)
+        self.deps("install", d)
+        self.assertNotIn("docker pull three-base", Path(self.env["FAKE_LOG"]).read_text())
+        self.deps("register", d, rc=0)
+        self.assertNotIn("three-base:latest", self.containers("list", rc=0).stdout)
+
+    def test_status_is_ready_without_pulling(self):
+        """CI runs status in every job: pulling every declared image there would cost gigabytes
+        each time, and docker pulls what a job runs anyway."""
+        self.images()
         res = subprocess.run(["python3", str(ROOT / "libexec" / "deps"), "status", "--no-network", self.b],
-                             capture_output=True, text=True, env={**env, "FAKE_RPMS": "curl=8-1 openssh-clients=9-1 python3=3.12-1 util-linux=2-1"})
-        self.assertIn("docker pull tobix/pywine:3.12", Path(self.env["FAKE_LOG"]).read_text())
+                             capture_output=True, text=True, env={**self.env, "FAKE_RPMS": "curl=8-1 openssh-clients=9-1 python3=3.12-1 util-linux=2-1"})
         self.assertIn("ready", res.stdout, res.stdout + res.stderr)
+        self.assertNotIn("docker pull", Path(self.env["FAKE_LOG"]).read_text())
 
     # -- containers list ------------------------------------------------------------------------
 

@@ -580,24 +580,28 @@ def image_matches(ref, img):
 
 
 def image_rows(wants, images):
-    """survey rows for container images: a pulled one missing is a problem; a built one not built
-    yet isn't (its script builds it)."""
+    """survey rows for container images. None missing is a problem: docker pulls a pulled one when a
+    script first runs it (deps install pulls them ahead), and a built one's script builds it. Only no
+    docker is."""
     rows = []
+    built = {r for r, w in wants.items() if "built" in w}
     for ref, want in sorted(wants.items()):
         if images is None:
             rows.append(("image", ref, want, "no docker", "missing"))
+        elif image_parts(ref)[0] in built and "built" not in want:
+            continue                                    # a built image used as another's base: its own row
         elif "built" in want:
             mine = [i for i in images if any(image_parts(t)[0] == ref for t in i["tags"])]
             rows.append(("image", ref, want, f"{len(mine)} build(s)" if mine else f"not built yet ({want['built']})", None))
         else:
             here = any(image_matches(ref, i) for i in images)
-            rows.append(("image", ref, want, "here" if here else "not here", None if here else "missing"))
+            rows.append(("image", ref, want, "here" if here else "not here (pulled on first use)", None))
     return rows
 
 
 def pull_commands(rows):
     return [[DOCKER, "pull", name] for kind, name, want, state, problem in rows
-            if kind == "image" and problem and state == "not here"]
+            if kind == "image" and state.startswith("not here")]
 
 
 def size_text(n):
@@ -674,9 +678,10 @@ def containers(args):
             text = {"claimed": f"claimed by {', '.join(who)}", "superseded": f"superseded: an older build of {what} ({', '.join(who)})",
                     "near miss": f"near miss: declared is {what}", "undeclared": "undeclared", "dangling": "dangling (no tag)"}[st]
             print(f"{name(i)} | {size_text(i['size'])} | {text}")
+        built = {r for r, w in wants.items() if "built" in w}
         for ref in sorted(set(wants) | set(recipes)):
             w = wants.get(ref, {})
-            if "built" in w or any(image_matches(ref, i) for i in images):
+            if "built" in w or image_parts(ref)[0] in built or any(image_matches(ref, i) for i in images):
                 continue
             print(f"{ref} | not here | wanted by {', '.join(w.get('from', []) or recipes.get(ref, []))}")
         df = subprocess.run([DOCKER, "system", "df", "--format", "{{json .}}"], capture_output=True, text=True)
@@ -911,7 +916,6 @@ def status(args):
     me = os.path.realpath(__file__)
     unattended = os.environ.get("COWORKER_UNATTENDED") == "1"
     print(f"coworker {protocol()} in {HOME}; {project} at {folder}")
-    run_all(pull_commands(survey([folder], network=False)), False)     # adding an image is automated
     if unattended:
         rows = survey([folder], network=False)
         ok = run_all(pip_commands(rows), False)

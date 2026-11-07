@@ -476,9 +476,11 @@ claiming, so nothing else records who needs an image:
 a project runs and removes (`docker run --rm`) aren't declared. A VM's own image is its recipe's
 (`IMAGE` in `recipe.env`), claimed by the VM.
 
-- **`deps check`** lists each declared image: a pulled one that isn't here is `MISSING`; a built
-  one that isn't built yet isn't a problem (its script builds it). `deps install` and
-  `coworker status` pull the missing ones: adding an image changes nothing for anyone else.
+- **`deps check`** lists each declared image and whether it's here. One that isn't is no problem:
+  docker pulls a pulled image when a script first runs it, and a built one's script builds it
+  (a built image named as another's base is that one, never pulled). Only no docker is a problem.
+  `deps install` pulls the missing ones ahead, say before going offline. `coworker status` doesn't:
+  CI runs it in every job, and pulling every declared image there would cost gigabytes each time.
 
       containers list
       containers remove [--yes]
