@@ -113,6 +113,10 @@ project's own folders; this is for the shared ones.
 
 A VM's name is letters, digits, `-`, `_` and `.`; a project isn't named `lock`.
 
+A VM that runs in a Docker container has the container named `coworker-<vm>` (the VM `win10`
+runs as `coworker-win10`), so `docker ps` says which containers are the shared VMs. Its `vm.env`
+names it as `VM_CONTAINER`, and scripts use that rather than the name itself.
+
 ### `vm.env`
 
 Shell assignments; paths are relative to the VM's folder.
@@ -120,7 +124,7 @@ Shell assignments; paths are relative to the VM's folder.
 | Setting | What it is |
 |---|---|
 | `VM_OS` | what runs in it, e.g. `Windows 10 Pro 22H2` |
-| `VM_CONTAINER` | the Docker container that runs it, if one does (`docker start` starts it) |
+| `VM_CONTAINER` | the Docker container that runs it, if one does: `coworker-<vm>` (`docker start` starts it) |
 | `VM_SSH_HOST` | where its SSH server is reached (default `127.0.0.1`) |
 | `VM_SSH_PORT` | that port (required) |
 | `VM_SSH_USER` | the account a project's scripts sign in as (required) |
@@ -174,8 +178,8 @@ Maintenance:
   no project: ask the machine's owner before deleting it.
 - **A held lock with no run behind it** can't happen: the lock is a `flock` on `<vm>.lock`, and it
   goes with the process that holds it. The file's text is only the last holder's name.
-- **Adding a VM:** its folder in `vms/`, with `README.md` and `vm.env`; then each project that
-  needs it claims it.
+- **Adding a VM:** its folder in `vms/`, with `README.md` and `vm.env` (and, if a container runs
+  it, the container named `coworker-<vm>`); then each project that needs it claims it.
 
 ## Tests
 
