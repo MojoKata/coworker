@@ -219,7 +219,7 @@ create_locked() {
     . "$R/recipe.env"
     cd "$H" || return 1
     for f in ssh.sh scp.sh shot.sh keys.sh; do install -m 755 "$R/$f" "$f"; done
-    install -m 644 "$R/update.ps1" update.ps1
+    install -m 644 "$R/update.ps1" "$R/install-msu.ps1" .
     mkdir -p oem
     install -m 644 "$R/oem/install.bat" "$R/oem/vmctl.py" oem/
     [ -s password.txt ] || (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(18))' > password.txt)
@@ -282,8 +282,60 @@ host_keys() {   # known_hosts: the keys the guest says it has, as they answer on
     mv known_hosts.new known_hosts
 }
 
-update_rounds() { # Windows Update as SYSTEM (update.ps1), rebooting as it asks, until nothing is left
+at_least() {     # at_least BUILD MIN: BUILD is MIN or later (dotted numbers)
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]
+}
+guest_task() {  # guest_task NAME RESULT COMMAND: COMMAND as SYSTEM in a scheduled task; waits for C:\coworker\RESULT into $res
+    vssh yes "Remove-Item C:\\coworker\\$2 -ErrorAction SilentlyContinue
+        schtasks /create /tn $1 /tr '$3' /sc once /st 23:59 /ru SYSTEM /rl HIGHEST /f | Out-Null
+        schtasks /run /tn $1 | Out-Null" >/dev/null || return 69
+    end=$(( $(date +%s) + ${COWORKER_VM_UPDATE_WAIT:-10800} ))
+    res=""
+    while [ -z "$res" ]; do
+        [ "$(date +%s)" -lt "$end" ] || { echo "vms: $VM: $1 didn't finish in ${COWORKER_VM_UPDATE_WAIT:-10800} s" >&2; return 1; }
+        sleep "${COWORKER_VM_POLL:-15}"
+        res=$(vssh yes "Get-Content C:\\coworker\\$2 -ErrorAction SilentlyContinue" | tr -d '\r' | grep -E '^(DONE|FAILED)' || true)
+    done
+}
+restart_guest() {
+    echo "$VM: restarting, as the update asks"
+    vssh yes 'shutdown /r /t 5' >/dev/null || true
+    sleep "${COWORKER_VM_REBOOT_PAUSE:-90}"
+    wait_ssh yes "${COWORKER_VM_BOOT_WAIT:-1800}"
+}
+to_guest() {    # to_guest FILE: copy FILE into C:\coworker\ on the guest
+    "${COWORKER_SCP:-scp}" -q -i "$VM_SSH_KEY" -P "$VM_SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$VM_KNOWN_HOSTS" \
+        "$1" "$VM_SSH_USER@$VM_SSH_HOST:C:/coworker/$(basename "$1")"
+}
+
+lcu() {         # the recipe's last cumulative update (LCU_*), when the guest's build is older than it
+    [ -n "${LCU_URL:-}" ] || return 0
+    b=$(guest_build)
+    if at_least "$b" "$LCU_BUILD"; then return 0; fi
+    f="$VM_HOME/updates/${LCU_URL##*/}"
+    if ! echo "$LCU_SHA256  $f" | sha256sum -c --quiet >/dev/null 2>&1; then
+        mkdir -p "$VM_HOME/updates"
+        echo "$VM: fetching ${LCU_URL##*/}"
+        curl -fsSL -o "$f.part" "$LCU_URL" || return 1
+        echo "$LCU_SHA256  $f.part" | sha256sum -c --quiet || { echo "vms: $LCU_URL isn't the file the recipe pins" >&2; return 1; }
+        mv "$f.part" "$f"
+    fi
+    echo "$VM: build $b; installing ${LCU_URL##*/} (build $LCU_BUILD)"
+    { to_guest "$VM_HOME/install-msu.ps1" && to_guest "$f"; } || return 69
+    guest_task coworker-msu msu.result "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\coworker\\install-msu.ps1 C:\\coworker\\${LCU_URL##*/}" || return $?
+    echo "$VM: $res"
+    case $res in
+        "DONE exit=0"|"DONE exit=2359302") ;;
+        "DONE exit=3010") restart_guest || return $? ;;
+        *) echo "vms: $VM: ${LCU_URL##*/} didn't install ($res)" >&2; return 1 ;;
+    esac
+    vssh yes 'Remove-Item C:\coworker\*.msu -ErrorAction SilentlyContinue' >/dev/null || true
+}
+
+update_rounds() { # the recipe's last cumulative update, then Windows Update as SYSTEM (update.ps1),
+                  # restarting as it asks, until nothing is left
     vssh yes 'New-Item -ItemType Directory -Force C:\coworker | Out-Null' >/dev/null || return 69
+    lcu || return $?
     i=0
     while [ "$i" -lt "${COWORKER_VM_UPDATE_ROUNDS:-8}" ]; do
         i=$((i + 1))
@@ -314,6 +366,10 @@ update_rounds() { # Windows Update as SYSTEM (update.ps1), rebooting as it asks,
         if [ "$inst" = 0 ]; then
             [ "$bad" = 0 ] || { echo "vms: $VM: $bad update(s) keep failing to install (C:\coworker\update.log)" >&2; return 1; }
             b=$(guest_build)
+            if [ -n "${LCU_BUILD:-}" ] && ! at_least "$b" "$LCU_BUILD"; then
+                echo "vms: $VM: Windows Update has nothing more, but the build is $b, older than the recipe's $LCU_BUILD" >&2
+                return 1
+            fi
             printf '%s %s\n' "$(date -u +%Y-%m-%d)" "$b" > "$VM_HOME/updated"
             echo "$VM: up to date, build $b"
             return 0
@@ -328,13 +384,14 @@ update() {
     VM=$(basename "$1")
     [ -f "$DIR/$VM/vm.env" ] || { echo "vms: no $DIR/$VM/vm.env (README.md, \"vm.env\")" >&2; exit 1; }
     if [ -f "$RECIPES/$VM/update.ps1" ]; then          # the recipe's, also for a VM vms create didn't build
-        install -m 644 "$RECIPES/$VM/update.ps1" "$DIR/$VM/update.ps1"
+        install -m 644 "$RECIPES/$VM/update.ps1" "$RECIPES/$VM/install-msu.ps1" "$DIR/$VM/"
     fi
     [ -f "$DIR/$VM/update.ps1" ] || { echo "vms: no update.ps1 for $VM: it has no recipe (README.md, \"VM recipes\")" >&2; exit 1; }
     lock "$VM" coworker -- update_locked
 }
 
 update_locked() {
+    [ -f "$RECIPES/$VM/recipe.env" ] && . "$RECIPES/$VM/recipe.env"
     eval "$(env_of "$VM")"
     export VM_HOME VM_OS VM_CONTAINER VM_SSH_HOST VM_SSH_PORT VM_SSH_USER VM_SSH_KEY VM_KNOWN_HOSTS
     STARTED=0; KEEP=0; P=coworker

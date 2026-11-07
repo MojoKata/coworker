@@ -37,7 +37,10 @@ case $last in
     if [ -f "$FAKE_RESULTS" ] && [ -s "$FAKE_RESULTS" ]; then
       head -1 "$FAKE_RESULTS"; sed -i 1d "$FAKE_RESULTS"
     fi ;;
-  *CurrentBuild*) printf '10.0.19045.6456\\r\\n' ;;
+  *CurrentBuild*)
+    if [ -s "$FAKE_BUILDS" ]; then printf '%s\\r\\n' "$(head -1 "$FAKE_BUILDS")"; [ "$(wc -l < "$FAKE_BUILDS")" -gt 1 ] && sed -i 1d "$FAKE_BUILDS"
+    else printf '10.0.19045.6456\\r\\n'; fi ;;
+  *Get-Content*msu.result*) echo "$FAKE_MSU" ;;
   *-Command\ -) cat > /dev/null; printf '%s\\r\\n' "$FAKE_GUEST" ;;
   *) ;;
 esac
@@ -61,7 +64,8 @@ class Recipes(Case):
             (stubs / name).chmod(0o755)
         self.env.update(COWORKER_SSH=str(stubs / "ssh"), COWORKER_SCP=str(stubs / "scp"),
                         COWORKER_SSH_KEYSCAN=str(stubs / "ssh-keyscan"), FAKE_UP=str(self.tmp / "up"),
-                        FAKE_EXISTS=str(self.tmp / "exists"), FAKE_RESULTS=str(self.tmp / "results"),
+                        FAKE_EXISTS=str(self.tmp / "exists"), FAKE_RESULTS=str(self.tmp / "results"), FAKE_BUILDS=str(self.tmp / "builds"),
+                        FAKE_MSU="DONE exit=3010",
                         FAKE_GUEST="10.0.19045.6456|22H2|Windows 10 Pro", COWORKER_VM_POLL="0.05", COWORKER_VM_UPDATE_WAIT="5",
                         COWORKER_VM_REBOOT_PAUSE="0", COWORKER_VM_BOOT_WAIT="5", COWORKER_VM_INSTALL_WAIT="5")
         shutil.copytree(ROOT / "vms", self.home / "recipes")
@@ -71,6 +75,10 @@ class Recipes(Case):
         text = recipe.read_text()
         text = text.replace(text.split("OPENSSH_URL=")[1].split("\n")[0], f"file://{zipfile}")
         text = text.replace(text.split("OPENSSH_SHA256=")[1].split("\n")[0], hashlib.sha256(b"not really a zip").hexdigest())
+        msu = self.tmp / "kb.msu"
+        msu.write_bytes(b"a cumulative update")
+        text = text.replace(text.split("LCU_URL=")[1].split("\n")[0], f"file://{msu}")
+        text = text.replace(text.split("LCU_SHA256=")[1].split("\n")[0], hashlib.sha256(b"a cumulative update").hexdigest())
         recipe.write_text(text)
         self.vm = self.home / "vms" / "win10"
 
@@ -162,6 +170,34 @@ class Recipes(Case):
         self.built()
         Path(self.env["FAKE_RESULTS"]).write_text("FAILED 0x8024402c\n")
         self.vms("update", "win10", rc=1)
+
+    def test_update_installs_the_recipes_last_cumulative_update_when_the_build_is_older(self):
+        self.built()
+        Path(self.env["FAKE_BUILDS"]).write_text("10.0.19045.3803\n10.0.19045.6456\n")
+        Path(self.env["FAKE_RESULTS"]).write_text("DONE installed=0 failed=0 reboot=0\n")
+        out = self.vms("update", "win10", rc=0).stdout
+        self.assertIn("build 10.0.19045.3803; installing kb.msu (build 10.0.19045.6456)", out)
+        self.assertIn("DONE exit=3010", out)
+        log = self.log()
+        self.assertIn("kb.msu", log)                                      # copied to the guest
+        self.assertIn("schtasks /run /tn coworker-msu", log)
+        self.assertIn("shutdown /r", log)                                 # 3010: a restart
+        self.assertTrue((self.vm / "updates" / "kb.msu").exists())       # kept for the next build
+        self.assertEqual((self.vm / "updated").read_text().split()[1], "10.0.19045.6456")
+
+    def test_update_refuses_to_call_a_build_older_than_the_recipes_up_to_date(self):
+        self.built()
+        Path(self.env["FAKE_BUILDS"]).write_text("10.0.19045.3803\n")
+        Path(self.env["FAKE_RESULTS"]).write_text("DONE installed=0 failed=0 reboot=0\n")
+        res = self.vms("update", "win10", rc=1, FAKE_MSU="DONE exit=2359302")   # "already installed", yet older
+        self.assertIn("older than the recipe's 10.0.19045.6456", res.stderr)
+        self.assertFalse((self.vm / "updated").exists())
+
+    def test_update_stops_when_the_cumulative_update_fails(self):
+        self.built()
+        Path(self.env["FAKE_BUILDS"]).write_text("10.0.19045.3803\n")
+        res = self.vms("update", "win10", rc=1, FAKE_MSU="DONE exit=-2145124329")
+        self.assertIn("didn't install (DONE exit=-2145124329)", res.stderr)
 
     # -- a project's need: updated within so many days -------------------------------------------
 

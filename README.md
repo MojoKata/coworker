@@ -436,11 +436,15 @@ change to every project's test machine: the machine's owner's call, through a PR
   (`COWORKER_VM_INSTALL_WAIT`, 2 h). It then writes `known_hosts` from the host keys the guest says
   it has, as they answer on the port, runs `update`, notes the build in `history`, and stops the VM.
   The VM's own files that aren't in the recipe (a project's helper scripts, its `README.md`) stay.
-- **`update`** runs Windows Update in the guest until nothing is left, under the VM's lock: it
-  starts the VM if it's down (and stops it after), runs `update.ps1` as SYSTEM through a scheduled
+- **`update`** brings the guest up to date, under the VM's lock: it starts the VM if it's down (and
+  stops it after). When the recipe pins a last cumulative update (`LCU_URL`, `LCU_SHA256`,
+  `LCU_BUILD`) and the guest is older, it fetches it (kept in `<vm>/updates/`), installs it with
+  `wusa` as SYSTEM and restarts: Windows 10 is past its end of support, and Windows Update offers its
+  cumulative updates only to machines with Extended Security Updates. Then it runs `update.ps1` as SYSTEM through a scheduled
   task (the update API refuses an SSH session), restarts the guest when an update asks, and goes
   round again (at most 8 rounds; each may take up to 3 h, `COWORKER_VM_UPDATE_WAIT`). When a round
-  finds nothing to install it writes `<vm>/updated` (the day and the build), which a project's
+  finds nothing to install, and the build is at least `LCU_BUILD`, it writes `<vm>/updated` (the
+  day and the build), which a project's
   `updated_within_days` need reads. Exit 1 when updates keep failing (`C:\coworker\update.log` in
   the guest says which).
 
