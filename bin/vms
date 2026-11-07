@@ -123,8 +123,8 @@ run_() {         # exit: 1 the host lacks a need (deps install), 65 the projects
         esac
     done
     [ $# -gt 0 ] || usage
-    P=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("project", ""))' "$D/.coworker/deps.json" 2>/dev/null) \
-        || { echo "vms: no $D/.coworker/deps.json (README.md, \"Dependencies\")" >&2; exit 2; }
+    [ -f "$D/.coworker/deps.json" ] || { echo "vms: no $D/.coworker/deps.json (README.md, \"Dependencies\")" >&2; exit 2; }
+    P=$(basename "$(cd "$D" && pwd)")     # a project's name is its checkout directory's
     "$DEPS" vm-claim "$VM" "$D" || exit $?
     lock "$VM" "$P" $NOWAIT -- run_locked "$@"
 }

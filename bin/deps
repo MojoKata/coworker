@@ -306,6 +306,15 @@ def check_vm(section, where):
         raise Bad(f"{where}: os: a pin with a min or max")
 
 
+def project_name(folder):
+    """A project's name is its checkout directory's name: what it claims under and registers as."""
+    name = os.path.basename(os.path.abspath(folder))
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name == "lock":
+        raise Bad(f"{folder}: a project's name is its checkout directory's name, which must be letters, "
+                  f"digits, - and _ (and not lock)")
+    return name
+
+
 def load(folder):
     path = os.path.join(folder, ".coworker", "deps.json")
     try:
@@ -320,6 +329,9 @@ def load(folder):
     for k in data:
         if k not in KEYS and k not in ("project", "vms"):
             raise Bad(f"{path}: unknown key {k!r} (project, host, pips, network, tools, vms)")
+    if "project" in data and data["project"] != project_name(folder):
+        raise Bad(f"{path}: \"project\" is {data['project']!r}, but a project's name is its checkout "
+                  f"directory's, {project_name(folder)!r}: drop the key (or rename the directory)")
     check_lists(data, path)
     vms = data.get("vms", {})
     if not isinstance(vms, dict):
@@ -372,7 +384,9 @@ def folders(args):
         f = os.path.abspath(f)
         if f not in seen:
             seen.add(f)
-            label = label or load(f).get("project") or os.path.basename(f)
+            if label is None:
+                load(f)
+                label = project_name(f)
             if f != os.path.abspath(HOME) and euid() != 0:      # root writes nothing in the user's home
                 remember(f, label)
             out.append((f, label))
@@ -626,7 +640,7 @@ def register(args):
         raise Bad("usage: deps register DIR")
     folder = os.path.abspath(args[0])
     data = load(folder)
-    project = data.get("project") or os.path.basename(folder)
+    project = project_name(folder)
     if euid() != 0:
         remember(folder, project)
     left = [r for r in survey_from(wanted_from([(project, data)]), network=False) if r[4]]
@@ -734,9 +748,7 @@ def vm_claim(args):
     vm, d = args
     folder = os.path.abspath(d)
     data = load(folder)
-    project = data.get("project")
-    if not project or not re.fullmatch(r"[A-Za-z0-9_-]+", project) or project == "lock":
-        raise Bad(f"{folder}/.coworker/deps.json: claiming a VM needs \"project\": the name it claims under")
+    project = project_name(folder)
     vf = vm_folder(vm)
     if not os.path.isdir(vf):
         raise Bad(f"no VM {vm} in {os.path.dirname(vf)}")

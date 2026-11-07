@@ -170,9 +170,12 @@ class Check(Case):
         e = self.project("e", {"host": [{"package": "x", "max": "1.0", "why": "e's"}]})
         self.assertIn("at least 1.10 and at most 1.0", self.deps("check", "--no-network", b, e, rc=65).stderr)
 
-    def test_a_projects_name_labels_its_needs(self):
-        p = self.project("checkout-dir", {"project": "one", "host": [{"package": "a", "why": "w"}]})
-        self.assertIn("[one]", self.line(self.deps("check", "--no-network", p, rc=0, FAKE_RPMS="a=1-1").stdout, "a"))
+    def test_the_checkout_directory_names_the_project(self):
+        p = self.project("MyProject", {"host": [{"package": "a", "why": "w"}]})
+        self.assertIn("[MyProject]", self.line(self.deps("check", "--no-network", p, rc=0, FAKE_RPMS="a=1-1").stdout, "a"))
+        q = self.project("Other", {"project": "other", "host": []})
+        self.assertIn("a project's name is its checkout directory's, 'Other'", self.deps("check", "--no-network", q, rc=2).stderr)
+        self.deps("check", "--no-network", self.project("Same", {"project": "Same"}), rc=0)
 
     def test_the_coworker_homes_own_needs_always_count(self):
         self.project("home", {"host": [{"package": "curl", "why": "downloads fetch"}]}, folder="coworker")
@@ -347,13 +350,13 @@ class Install(Case):
 
 class Remembered(Case):
     def test_a_dir_is_remembered_and_a_run_with_none_covers_it(self):
-        p = self.project("checkout", {"project": "one", "host": [{"package": "a", "why": "w"}]})
+        p = self.project("one", {"host": [{"package": "a", "why": "w"}]})
         self.deps("check", "--no-network", p, rc=1)
         self.assertEqual((self.home / "projects" / "one").read_text().strip(), p)
         self.assertIn("dnf install -y a", self.deps("install", "--dry-run", rc=0).stderr)
 
     def test_a_remembered_checkout_that_is_gone_is_skipped_and_said(self):
-        p = self.project("checkout", {"project": "one", "host": [{"package": "a", "why": "w"}]})
+        p = self.project("one", {"host": [{"package": "a", "why": "w"}]})
         self.deps("check", "--no-network", p, rc=1)
         shutil.rmtree(p)
         res = self.deps("install", rc=0)
@@ -363,7 +366,7 @@ class Remembered(Case):
 
 class Register(Case):
     def test_register_remembers_and_only_mentions_what_is_missing(self):
-        p = self.project("checkout", {"project": "one", "host": [{"package": "a", "why": "w"}, {"package": "b", "why": "w"}]})
+        p = self.project("one", {"host": [{"package": "a", "why": "w"}, {"package": "b", "why": "w"}]})
         res = self.deps("register", p, rc=0, FAKE_RPMS="b=1-1")
         self.assertEqual(res.stdout, "")
         self.assertIn("lacks 1 of one's needs (a)", res.stderr)
@@ -604,6 +607,7 @@ class VmsRun(Case):
         out = subprocess.run(["sh", VMS, "list"], capture_output=True, text=True, env=self.env).stdout
         self.assertIn("win | Windows 10 Pro 22H2 | claimed by one | free", out)
 
-    def test_claiming_needs_a_project_name(self):
-        p = self.project("one", {"host": []})
-        self.assertIn('needs "project"', self.run_vm(p, "true", rc=2).stderr)
+    def test_the_claim_is_named_after_the_checkout_directory(self):
+        self.run_vm(self.project("MyProject", {}), "true", rc=0)
+        self.assertTrue((self.home / "vms" / "win.MyProject").exists())
+        self.assertIn("must be letters, digits", self.run_vm(self.project("my.project", {}), "true", rc=2).stderr)

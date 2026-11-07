@@ -36,7 +36,9 @@ made a run that starts a VM stop it; version 3 added `deps` and a project's `.co
 
 ## In a project
 
-- **Its name.** A project claims things under one name: letters, digits, `-` and `_`.
+- **Its name.** A project's name is its checkout directory's name (`~/MyProject` claims as
+  `MyProject`): letters, digits, `-` and `_`. `deps` and `vms run` take it from the directory; a script
+  that calls `downloads` or `vms claim` itself passes the same (`"$(basename "$HERE")"`).
 - **Calling the commands.** A project's scripts call the installed copies, and say how to get them
   when they're missing:
 
@@ -150,7 +152,7 @@ ones, and a rebuild keeps them.
     vms list
 
 - **`run`** is the one call a project's script makes: `DIR` is the project's checkout. It
-  1. claims the VM for the project (its `deps.json` names it) with what the project needs of the VM
+  1. claims the VM for the project (named after its checkout directory) with what the project needs of the VM
      (its `"vms"` entry, [below](#what-a-project-needs-of-a-vm)) written into the claim;
   2. merges every claimant's needs, and stops (exit **65**) if they can't all hold;
   3. checks that the host has what using the VM takes (exit **1**: `deps install`); the project's
@@ -262,7 +264,6 @@ checkout that's gone is skipped and said; delete its file when the project is.
 
 ```json
 {
-  "project": "myproject",
   "host": [
     { "package": "libglvnd-glx", "platform": "rocky-10*", "min": "1.7.0", "why": "Qt's libGL, for the tests" },
     { "package": "libgl1", "platform": "ubuntu*", "why": "Qt's libGL, for the tests" }
@@ -280,7 +281,7 @@ checkout that's gone is skipped and said; delete its file when the project is.
 
 | Key | What it is |
 |---|---|
-| `project` | the project's name (as it claims things); labels its needs in the output |
+| `project` | optional: if present, it must be the checkout directory's name (a project's name is its directory's) |
 | `host` | host packages: `package` is the distribution's name for it (`dnf`/`apt`) |
 | `pips` | pips in the system Python (`python3`): `pip` is the distribution name (`pillow`, not `PIL`) |
 | `tools` | what comes from its own installer, not the package manager (an SDK, Nix): `tool`, found by `command` (on `PATH`) or `path` (`~` allowed), and `how` to install it, which `deps install` prints and never runs |
