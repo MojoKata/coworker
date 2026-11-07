@@ -27,7 +27,8 @@ they run installed or from a checkout.
 `install.sh` copies `bin/downloads` and `bin/vms` into `$COWORKER_HOME/bin` (copies, not links),
 writes `VERSION`, and creates `downloads/` and `vms/` if they're missing. It never touches what's in
 them, so updating is `git pull` and `install.sh` again. Versions are this repository's tags.
-(Versions 1 and 2 of the protocol lived as a `coworker/` folder copied into each project.)
+(Versions 1 and 2 of the protocol lived as a `coworker/` folder copied into each project; version 2
+made a run that starts a VM stop it.)
 
 ## In a project
 
@@ -159,8 +160,10 @@ Rules:
   not saved. A project's files go in folders named after the project (on Windows,
   `C:\Users\Public\<project>-…`). What a project installs, it uninstalls, unless the VM's
   `README.md` lists it as kept for everyone.
-- **Starting is fine; stopping is the owner's.** A project starts the VM if it isn't running and
-  leaves it running.
+- **A run that starts the VM stops it.** A project starts the VM if it isn't running, and then
+  stops it when the run ends, pass or fail, still holding the lock: an idle VM holds its memory for
+  nothing. A run that found it running leaves it running. A project may offer a way to keep it
+  running (for runs back to back); a VM left running that way is that project's to stop.
 - **The VM itself is everyone's.** Its account, password, key, ports, operating-system version and
   update policy change only by the machine's owner, through its `README.md`, and a rebuild keeps
   what `vm.env` says.
