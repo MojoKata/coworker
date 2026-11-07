@@ -166,9 +166,9 @@ class Check(Case):
         self.assertIn("[a, b]", self.line(out, "x"))
         c = self.project("c", {"host": [{"package": "x", "pin": "1.0", "why": "c's"}]})
         d = self.project("d", {"host": [{"package": "x", "pin": "2.0", "why": "d's"}]})
-        self.assertIn("pinned to 1.0 and to 2.0", self.deps("check", "--no-network", c, d, rc=2).stderr)
+        self.assertIn("pinned to 1.0 and to 2.0", self.deps("check", "--no-network", c, d, rc=65).stderr)
         e = self.project("e", {"host": [{"package": "x", "max": "1.0", "why": "e's"}]})
-        self.assertIn("at least 1.10 and at most 1.0", self.deps("check", "--no-network", b, e, rc=2).stderr)
+        self.assertIn("at least 1.10 and at most 1.0", self.deps("check", "--no-network", b, e, rc=65).stderr)
 
     def test_a_projects_name_labels_its_needs(self):
         p = self.project("checkout-dir", {"project": "one", "host": [{"package": "a", "why": "w"}]})
@@ -371,7 +371,7 @@ class Network(Case):
     def test_two_projects_probing_one_host_two_ways_is_a_clash(self):
         a = self.project("a", {"network": [{"host": "h", "port": 8080, "probe": "http", "why": "a"}]})
         b = self.project("b", {"network": [{"host": "h", "port": 8080, "probe": "tcp", "why": "b"}]})
-        self.assertIn("probed as http and as tcp", self.deps("hosts", a, b, rc=2).stderr)
+        self.assertIn("probed as http and as tcp", self.deps("hosts", a, b, rc=65).stderr)
 
     def test_a_certificate_that_doesnt_verify_is_a_problem(self):
         p = self.project("one", {"network": [{"host": "localhost", "port": self.tls_port, "why": "self-signed"}]})
@@ -393,3 +393,121 @@ class InstallScript(Case):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+DOCKER = """#!/bin/sh
+# docker inspect|start|stop for the stand-in VM: running while FAKE_UP exists
+case $1 in
+  inspect) [ -f "$FAKE_UP" ] && echo true || echo false ;;
+  start) echo "docker start $2" >> "$FAKE_LOG"; touch "$FAKE_UP" ;;
+  stop) echo "docker stop $4" >> "$FAKE_LOG"; rm -f "$FAKE_UP" ;;
+esac
+"""
+SSH = """#!/bin/sh
+# ssh ... COMMAND: answers while FAKE_UP exists; the OS query gets FAKE_GUEST
+for last; do :; done
+[ -f "$FAKE_UP" ] || { echo "ssh: connect to host: Connection refused" >&2; exit 255; }
+case $last in
+  "echo up") echo up ;;
+  *) cat > /dev/null; printf '%s\\r\\n' "$FAKE_GUEST" ;;
+esac
+"""
+VMS = str(ROOT / "bin" / "vms")
+WIN = {"family": "windows", "name": "Windows 10 Pro", "version": "22H2", "min": "10.0.19045", "why": "Setup's MinVersion"}
+
+
+class VmsRun(Case):
+    def setUp(self):
+        super().setUp()
+        for name, text in (("docker", DOCKER), ("ssh", SSH)):
+            (self.tmp / "stubs" / name).write_text(text)
+            (self.tmp / "stubs" / name).chmod(0o755)
+        vm = self.home / "vms" / "win"
+        vm.mkdir(parents=True)
+        (vm / "vm.env").write_text("VM_OS=\"Windows 10 Pro 22H2\"\nVM_CONTAINER=box\nVM_SSH_PORT=2222\n"
+                                   "VM_SSH_USER=tester\nVM_SSH_KEY=vm_key\n")
+        self.env.update(COWORKER_SSH=str(self.tmp / "stubs" / "ssh"), FAKE_UP=str(self.tmp / "up"),
+                        FAKE_GUEST="10.0.19045.6456|22H2|Windows 10 Pro", COWORKER_VM_BOOT_WAIT="2")
+
+    def run_vm(self, d, *cmd, opts=(), rc=None, **env):
+        res = subprocess.run(["sh", VMS, "run", "win", d, *opts, "--", *cmd], capture_output=True, text=True,
+                             timeout=60, env={**self.env, **env})
+        if rc is not None:
+            self.assertEqual(res.returncode, rc, res.stdout + res.stderr)
+        return res
+
+    def log(self):
+        f = self.tmp / "log"
+        return f.read_text().splitlines() if f.exists() else []
+
+    def test_a_run_starts_the_vm_checks_it_runs_and_stops_it(self):
+        p = self.project("one", {"project": "one", "vms": {"win": {"os": WIN}}})
+        out = self.tmp / "seen"
+        res = self.run_vm(p, "sh", "-c", f'echo "$COWORKER_VM_LOCKED $VM_SSH_PORT $VM_SSH_USER" > {out}', rc=0)
+        self.assertEqual(out.read_text().split(), ["win", "2222", "tester"])
+        self.assertEqual(self.log(), ["docker start box", "docker stop box"])
+        self.assertIn("win runs Windows 10 Pro 22H2 (build 10.0.19045.6456): meets", res.stdout)
+        claim = json.loads((self.home / "vms" / "win.one").read_text())
+        self.assertEqual((claim["project"], claim["needs"]["os"]["min"]), ("one", "10.0.19045"))
+
+    def test_a_vm_found_running_is_left_running_and_keep_vm_keeps_one_it_started(self):
+        p = self.project("one", {"project": "one"})
+        (self.tmp / "up").touch()
+        self.run_vm(p, "true", rc=0)
+        self.assertEqual(self.log(), [])
+        (self.tmp / "up").unlink()
+        res = self.run_vm(p, "true", opts=["--keep-vm"], rc=0)
+        self.assertEqual(self.log(), ["docker start box"])
+        self.assertIn("left running (--keep-vm): stopping it is one's", res.stdout)
+
+    def test_the_commands_exit_is_the_runs_and_the_vm_still_stops(self):
+        p = self.project("one", {"project": "one"})
+        self.run_vm(p, "sh", "-c", "exit 3", rc=3)
+        self.assertEqual(self.log(), ["docker start box", "docker stop box"])
+
+    def test_two_projects_needing_different_guests_clash_before_anything_runs(self):
+        self.run_vm(self.project("one", {"project": "one", "vms": {"win": {"os": WIN}}}), "true", rc=0)
+        eleven = {**WIN, "name": "Windows 11 Pro", "why": "two wants 11"}
+        res = self.run_vm(self.project("two", {"project": "two", "vms": {"win": {"os": eleven}}}),
+                          "touch", str(self.tmp / "ran"), rc=65)
+        self.assertIn("one needs name 'Windows 10 Pro', two needs 'Windows 11 Pro'", res.stderr)
+        self.assertFalse((self.tmp / "ran").exists())
+        self.assertEqual(self.log(), ["docker start box", "docker stop box"])     # only the first run's
+
+    def test_builds_combine_across_projects_and_a_guest_below_them_is_refused(self):
+        self.project("one", {"project": "one", "vms": {"win": {"os": WIN}}})
+        self.run_vm(self.tmp / "one", "true", rc=0)
+        newer = {**WIN, "min": "10.0.19045.6000", "why": "two needs the 2025 patches"}
+        res = self.run_vm(self.project("two", {"project": "two", "vms": {"win": {"os": newer}}}),
+                          "touch", str(self.tmp / "ran"), rc=69, FAKE_GUEST="10.0.19045.3803|22H2|Windows 10 Pro")
+        self.assertIn("build 10.0.19045.3803 is below 10.0.19045.6000", res.stderr)
+        self.assertIn("[one, two]", res.stderr)
+        self.assertFalse((self.tmp / "ran").exists())
+        self.assertEqual(self.log()[-1], "docker stop box")          # started for nothing: stopped again
+
+    def test_a_guest_that_never_answers_is_refused(self):
+        p = self.project("one", {"project": "one"})
+        res = self.run_vm(p, "true", rc=69, COWORKER_SSH="false")
+        self.assertIn("no SSH", res.stderr)
+
+    def test_a_host_need_for_the_vm_that_is_missing_stops_the_run(self):
+        p = self.project("one", {"project": "one", "vms": {"win": {"pips": [{"pip": "pillow", "why": "shot.sh"}]}}})
+        res = self.run_vm(p, "touch", str(self.tmp / "ran"), rc=1)
+        self.assertIn("pillow", res.stdout)
+        self.assertIn("[one, for win]", res.stdout)
+        self.assertFalse((self.tmp / "ran").exists())
+        self.assertEqual(self.log(), [])                               # never started
+
+    def test_the_projects_other_needs_are_mentioned_not_required(self):
+        p = self.project("one", {"project": "one", "host": [{"package": "qt-libs", "why": "the project's own tests"}]})
+        res = self.run_vm(p, "true", rc=0)
+        self.assertIn("lacks 1 of one's other needs, which this run doesn't use", res.stdout)
+
+    def test_vms_list_still_reads_claims_that_carry_needs(self):
+        self.run_vm(self.project("one", {"project": "one", "vms": {"win": {"os": WIN}}}), "true", rc=0)
+        out = subprocess.run(["sh", VMS, "list"], capture_output=True, text=True, env=self.env).stdout
+        self.assertIn("win | Windows 10 Pro 22H2 | claimed by one | free", out)
+
+    def test_claiming_needs_a_project_name(self):
+        p = self.project("one", {"host": []})
+        self.assertIn('needs "project"', self.run_vm(p, "true", rc=2).stderr)

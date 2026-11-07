@@ -4,6 +4,11 @@
 #
 #   vms claim   VM PROJECT                                PROJECT needs VM
 #   vms release VM PROJECT                                PROJECT is done with VM (never deletes it)
+#   vms run     VM DIR [--keep-vm] [--no-wait] -- COMMAND [ARG...]
+#                                                         the one call: claim VM with DIR's needs of
+#                                                         it, merge every claimant's, lock, start it
+#                                                         if it's down, check it, run COMMAND, stop it
+#                                                         if this run started it
 #   vms lock    VM PROJECT [--no-wait] -- COMMAND [ARG...]  run COMMAND holding VM's lock
 #   vms env     VM                                        how to reach VM, as assignments to eval
 #   vms list                                              every VM, its claims, and who holds it
@@ -12,7 +17,8 @@
 # it, and VM.lock, which names the holder while a run holds it.
 set -eu
 DIR=${COWORKER_HOME:-$HOME/coworker}/vms
-USAGE="usage: vms claim VM PROJECT | release VM PROJECT | lock VM PROJECT [--no-wait] -- COMMAND [ARG...] | env VM | list"
+USAGE="usage: vms run VM DIR [--keep-vm] [--no-wait] -- COMMAND [ARG...] | claim VM PROJECT | release VM PROJECT | lock VM PROJECT [--no-wait] -- COMMAND [ARG...] | env VM | list"
+DEPS="$(cd "$(dirname "$0")" && pwd)/deps"
 usage() { echo "$USAGE" >&2; exit 2; }
 
 project() {     # project NAME: exit 2 unless NAME can be a project's name
@@ -102,6 +108,55 @@ env_of() {      # VM_HOME and each VM_* setting in vm.env, with the key and know
     )
 }
 
+run_() {         # exit: 1 the host lacks a need (deps install), 65 the projects' needs clash,
+                # 69 the VM doesn't meet them (or won't start), 75 busy with --no-wait; else COMMAND's
+    [ $# -ge 2 ] || usage
+    VM=$(basename "$1"); D=$2
+    shift 2
+    KEEP=0; NOWAIT=""
+    while :; do
+        case ${1:-} in
+            --keep-vm) KEEP=1; shift ;;
+            --no-wait) NOWAIT=--no-wait; shift ;;
+            --) shift; break ;;
+            *) usage ;;
+        esac
+    done
+    [ $# -gt 0 ] || usage
+    P=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("project", ""))' "$D/.coworker/deps.json" 2>/dev/null) \
+        || { echo "vms: no $D/.coworker/deps.json (README.md, \"Dependencies\")" >&2; exit 2; }
+    "$DEPS" vm-claim "$VM" "$D" || exit $?
+    lock "$VM" "$P" $NOWAIT -- run_locked "$@"
+}
+
+run_locked() {  # under the lock: start the VM if it's down, check it, COMMAND, stop it if started here
+    eval "$(env_of "$VM")"
+    export VM_HOME VM_OS VM_CONTAINER VM_SSH_HOST VM_SSH_PORT VM_SSH_USER VM_SSH_KEY VM_KNOWN_HOSTS
+    STARTED=0
+    if [ -n "$VM_CONTAINER" ] && [ "$(docker inspect -f '{{.State.Running}}' "$VM_CONTAINER" 2>/dev/null)" != true ]; then
+        echo "starting $VM ($VM_CONTAINER)"
+        docker start "$VM_CONTAINER" >/dev/null || { echo "vms: couldn't start $VM_CONTAINER" >&2; return 69; }
+        STARTED=1
+        trap 'stop_started; exit 130' INT TERM HUP
+    fi
+    rc=0
+    "$DEPS" vm-guest "$VM" --wait "${COWORKER_VM_BOOT_WAIT:-900}" || rc=$?
+    [ "$rc" = 0 ] && { "$@" || rc=$?; }
+    stop_started
+    return "$rc"
+}
+
+stop_started() {
+    [ "$STARTED" = 1 ] || return 0
+    STARTED=0
+    if [ "$KEEP" = 1 ]; then
+        echo "$VM left running (--keep-vm): stopping it is $P's"
+    else
+        echo "stopping $VM (this run started it)"
+        docker stop -t 120 "$VM_CONTAINER" >/dev/null || echo "vms: couldn't stop $VM_CONTAINER" >&2
+    fi
+}
+
 list() {
     [ -d "$DIR" ] || { echo "no $DIR"; return 0; }
     cd "$DIR"
@@ -121,6 +176,7 @@ list() {
 cmd=${1:-}
 [ $# -gt 0 ] && shift
 case $cmd in
+    run) run_ "$@" ;;
     claim) claim "$@" ;;
     release) release "$@" ;;
     lock) lock "$@" ;;

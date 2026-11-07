@@ -18,7 +18,7 @@ home, which also holds the shared things; the checkout itself never holds them.
 | `$COWORKER_HOME/.coworker/deps.json` | coworker's own needs, installed from this checkout's |
 | `$COWORKER_HOME/projects/` | each project `deps` has seen: `<project>` holds its checkout's path |
 | `$COWORKER_HOME/downloads/` | the downloads, with their checksums and claims |
-| `$COWORKER_HOME/vms/` | the VMs' folders, with their claims and locks |
+| `$COWORKER_HOME/vms/` | the VMs' folders, with their claims (each project's needs of the VM) and locks |
 | `$COWORKER_HOME/VERSION` | what's installed (`git describe` of the checkout it came from) |
 
 `COWORKER_HOME` is the only setting. The commands use `${COWORKER_HOME:-$HOME/coworker}` whether
@@ -142,11 +142,28 @@ ones, and a rebuild keeps them.
 
 ### The command
 
+    vms run     VM DIR [--keep-vm] [--no-wait] -- COMMAND [ARG...]
     vms claim   VM PROJECT
     vms release VM PROJECT
     vms lock    VM PROJECT [--no-wait] -- COMMAND [ARG...]
     vms env     VM
     vms list
+
+- **`run`** is the one call a project's script makes: `DIR` is the project's checkout. It
+  1. claims the VM for the project (its `deps.json` names it) with what the project needs of the VM
+     (its `"vms"` entry, [below](#what-a-project-needs-of-a-vm)) written into the claim;
+  2. merges every claimant's needs, and stops (exit **65**) if they can't all hold;
+  3. checks that the host has what using the VM takes (exit **1**: `deps install`); the project's
+     other needs are only mentioned;
+  4. takes the lock (waiting for another project's run; `--no-wait`: exit **75**);
+  5. starts the VM's container if it's down, waits for SSH (`COWORKER_VM_BOOT_WAIT`, 900 s), and
+     checks the guest against the merged needs (exit **69** if it falls short);
+  6. runs `COMMAND` with `COWORKER_VM_LOCKED=<vm>` and every `vms env` setting exported;
+  7. stops the VM if this run started it, pass or fail (or Ctrl-C), unless `--keep-vm`.
+
+  The exit is `COMMAND`'s otherwise. A script re-runs itself under it:
+
+      [ -n "${COWORKER_VM_LOCKED:-}" ] || exec "$CW/bin/vms" run win10 "$HERE" -- sh "$0" "$@"
 
 - **`claim`** records that a project needs the VM. A script can run it each time: it's idempotent.
 - **`release`** removes a project's claim. It never deletes a VM: with the last claim gone it says
@@ -170,10 +187,14 @@ Rules:
   not saved. A project's files go in folders named after the project (on Windows,
   `C:\Users\Public\<project>-…`). What a project installs, it uninstalls, unless the VM's
   `README.md` lists it as kept for everyone.
-- **A run that starts the VM stops it.** A project starts the VM if it isn't running, and then
+- **A run that starts the VM stops it.** `vms run` starts the VM if it isn't running, and then
   stops it when the run ends, pass or fail, still holding the lock: an idle VM holds its memory for
-  nothing. A run that found it running leaves it running. A project may offer a way to keep it
-  running (for runs back to back); a VM left running that way is that project's to stop.
+  nothing. A run that found it running leaves it running. `--keep-vm` keeps it running (for runs back
+  to back); a VM left running that way is that project's to stop.
+- **Needs are merged, and a clash stops the run.** Each project says what it needs of a VM in its
+  own `deps.json`; `vms run` combines them all and refuses (65, 69, 1) rather than run on a VM some
+  project can't use. The agent working at the time sorts it out: in coworker, the project, the VM or
+  the system, with the machine's owner where it's theirs.
 - **The VM itself is everyone's.** Its account, password, key, ports, operating-system version and
   update policy change only by the machine's owner, through its `README.md`, and a rebuild keeps
   what `vm.env` says.
@@ -269,6 +290,30 @@ Rules:
   alone proves nothing for HTTPS or HTTP.
 - **`sudo` is the owner's.** An agent runs `deps install` and never the `--sudo` half; when host
   packages are missing it asks the owner to run `sudo ~/coworker/bin/deps install --sudo`.
+
+### What a project needs of a VM
+
+A project's `deps.json` says, under `"vms"`, what it needs of each shared VM it uses:
+
+```json
+"vms": {
+  "win10": {
+    "os": { "family": "windows", "name": "Windows 10 Pro", "version": "22H2", "min": "10.0.19045",
+            "why": "the Windows the project supports" },
+    "pips": [ { "pip": "pillow", "min": "13.0.0", "why": "shot.sh: its PNGs measured the best size and quality" } ]
+  }
+}
+```
+
+| Key | What it is |
+|---|---|
+| `os` | what the guest must be: `family` (`windows` or `linux`: how it's asked), `name` (contained in the guest's product name), `version` (the version people call it: `22H2`, `24.04`), and `min`, `max` or `pin` of its build (`10.0.19045.6456` on Windows, `VERSION_ID` on Linux); `why` |
+| `host`, `pips`, `network` | what the host needs to use the VM (as at the top level of `deps.json`) |
+
+`vms run` writes the project's entry into its claim (`<vm>.<project>`, beside the VM's folder), so
+the merge sees every project that uses the VM without knowing where their checkouts are. Merging:
+the same `family`, `name` and `version` (else a clash), the highest `min` and the lowest `max` of
+the build, one `pin`; the host needs as at the top level.
 
 ## Tests
 

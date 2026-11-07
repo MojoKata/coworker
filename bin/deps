@@ -8,6 +8,9 @@ one's .coworker/deps.json. README.md, "Dependencies".
   sudo deps install --sudo [-n] [DIR...]  as root only: installs the missing host packages (dnf/apt)
                                         -n: print the commands, run nothing
   deps hosts   [DIR...]                 every network host needed, and whether it answers
+  deps vm-claim VM DIR                  for vms run: claim VM with DIR's needs of it, merge every
+                                        claimant's, check the host side (exit 1 missing, 65 clash)
+  deps vm-guest VM [--wait SECONDS]     for vms run: the running guest meets the merged needs (69 not)
 
 A DIR is a project's checkout, holding .coworker/deps.json. The coworker home's own deps.json
 (installed by install.sh) always counts too. Each DIR is remembered in $COWORKER_HOME/projects/
@@ -46,14 +49,24 @@ def coworker_home():
 
 HOME = coworker_home()
 PYTHON = os.environ.get("COWORKER_PYTHON", "python3")
-USAGE = "usage: deps check [--no-network] [DIR...] | install [-n] [DIR...] | install --sudo [-n] [DIR...] (as root) | hosts [DIR...]"
+USAGE = ("usage: deps check [--no-network] [DIR...] | install [-n] [DIR...] | install --sudo [-n] [DIR...] (as root)"
+         " | hosts [DIR...] | vm-claim VM DIR | vm-guest VM [--wait SECONDS]")
+SSH = os.environ.get("COWORKER_SSH", "ssh")
 SUDO_HINT = "sudo ~/coworker/bin/deps install --sudo"
 KEYS = {"host": "package", "pips": "pip", "network": "host"}
 ENTRY_KEYS = {"platform", "min", "max", "pin", "why", "port", "probe"}
 
 
 class Bad(Exception):
-    pass
+    code = 2            # a deps.json that's wrong, or a wrong call
+
+
+class Clash(Bad):
+    code = 65           # two projects' needs that can't both hold
+
+
+class Unmet(Bad):
+    code = 69           # a shared VM that doesn't meet what its projects need
 
 
 # -- where the machine stands -------------------------------------------------------------------
@@ -224,20 +237,11 @@ def answers(host, port, probe="tls", timeout=float(os.environ.get("COWORKER_NET_
 
 # -- reading deps.json --------------------------------------------------------------------------
 
-def load(folder):
-    path = os.path.join(folder, ".coworker", "deps.json")
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        raise Bad(f"{folder}: no .coworker/deps.json")
-    except json.JSONDecodeError as e:
-        raise Bad(f"{path}: not JSON: {e}")
-    if not isinstance(data, dict):
-        raise Bad(f"{path}: not a JSON object")
-    for k in data:
-        if k not in KEYS and k != "project":
-            raise Bad(f"{path}: unknown key {k!r} (project, host, pips, network)")
+OS_FAMILIES = ("windows", "linux")
+
+
+def check_lists(data, path):
+    """Each host/pips/network entry in data (a deps.json, or one VM's section of it) well formed."""
     for kind, name_key in KEYS.items():
         entries = data.get(kind, [])
         if not isinstance(entries, list):
@@ -259,6 +263,52 @@ def load(folder):
                 raise Bad(f"{where} ({e[name_key]}): only a network host has a port or probe")
             if e.get("probe", "tls") not in ("tls", "http", "tcp"):
                 raise Bad(f"{where} ({e[name_key]}): probe is tls, http or tcp")
+
+
+def check_vm(section, where):
+    """One VM's needs: what its guest must be ("os"), and what the host needs to use it."""
+    if not isinstance(section, dict):
+        raise Bad(f"{where}: a VM's needs are an object")
+    for k in section:
+        if k not in KEYS and k != "os":
+            raise Bad(f"{where}: unknown key {k!r} (os, host, pips, network)")
+    check_lists(section, where)
+    o = section.get("os")
+    if o is None:
+        return
+    if not isinstance(o, dict):
+        raise Bad(f"{where}: os is an object")
+    extra = set(o) - {"family", "name", "version", "min", "max", "pin", "why"}
+    if extra:
+        raise Bad(f"{where}: os: unknown key {sorted(extra)[0]!r}")
+    if o.get("family") not in OS_FAMILIES:
+        raise Bad(f"{where}: os needs a family: {' or '.join(OS_FAMILIES)}")
+    if not isinstance(o.get("why"), str) or not o["why"].strip():
+        raise Bad(f"{where}: os needs a 'why'")
+    if "pin" in o and ("min" in o or "max" in o):
+        raise Bad(f"{where}: os: a pin with a min or max")
+
+
+def load(folder):
+    path = os.path.join(folder, ".coworker", "deps.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise Bad(f"{folder}: no .coworker/deps.json")
+    except json.JSONDecodeError as e:
+        raise Bad(f"{path}: not JSON: {e}")
+    if not isinstance(data, dict):
+        raise Bad(f"{path}: not a JSON object")
+    for k in data:
+        if k not in KEYS and k not in ("project", "vms"):
+            raise Bad(f"{path}: unknown key {k!r} (project, host, pips, network, vms)")
+    check_lists(data, path)
+    vms = data.get("vms", {})
+    if not isinstance(vms, dict):
+        raise Bad(f"{path}: vms maps each VM's name to what the project needs of it")
+    for vm, section in vms.items():
+        check_vm(section, f"{path}: vms.{vm}")
     return data
 
 
@@ -313,12 +363,16 @@ def folders(args):
 
 
 def wanted(args):
-    """{kind: {name: want}} for this platform: in each file the first entry whose platform matches
-    wins for its name; across files the ranges are combined, and a clash is an error."""
+    return wanted_from([(label, load(folder)) for folder, label in folders(args)])
+
+
+def wanted_from(sources):
+    """{kind: {name: want}} for this platform from [(label, data)]: in each source the first entry
+    whose platform matches wins for its name; across sources the ranges are combined, and two
+    that can't both hold are a Clash."""
     plat = platform()
     out = {k: {} for k in KEYS}
-    for folder, label in folders(args):
-        data = load(folder)
+    for label, data in sources:
         for kind, name_key in KEYS.items():
             taken = set()
             for e in data.get(kind, []):
@@ -330,7 +384,7 @@ def wanted(args):
                 if kind == "network":
                     probe = e.get("probe", default_probe(e.get("port", 443)))
                     if w.setdefault("probe", probe) != probe:
-                        raise Bad(f"{name}: probed as {w['probe']} and as {probe} ({', '.join(w['from'])})")
+                        raise Clash(f"{name}: probed as {w['probe']} and as {probe} ({', '.join(w['from'])})")
                 w["from"].append(label)
                 w["why"].append(e["why"])
                 for bound in ("min", "max", "pin"):
@@ -339,14 +393,14 @@ def wanted(args):
                     if bound not in w or w[bound] == e[bound]:
                         w[bound] = e[bound]
                     elif bound == "pin":
-                        raise Bad(f"{name}: pinned to {w['pin']} and to {e['pin']} ({', '.join(w['from'])})")
+                        raise Clash(f"{name}: pinned to {w['pin']} and to {e['pin']} ({', '.join(w['from'])})")
                     else:
                         cmp = pipvercmp if kind == "pips" else rpmvercmp
                         pick = max if bound == "min" else min
                         w[bound] = pick(w[bound], e[bound], key=lambda v: _Key(v, cmp))
                 lo, hi = w.get("pin", w.get("min")), w.get("pin", w.get("max"))
                 if lo and hi and (pipvercmp if kind == "pips" else rpmvercmp)(lo, hi) > 0:
-                    raise Bad(f"{name}: needs at least {lo} and at most {hi} ({', '.join(w['from'])})")
+                    raise Clash(f"{name}: needs at least {lo} and at most {hi} ({', '.join(w['from'])})")
     return out
 
 
@@ -361,8 +415,12 @@ class _Key:
 # -- the commands -------------------------------------------------------------------------------
 
 def survey(args, network=True, pips=True):
+    return survey_from(wanted(args), network, pips)
+
+
+def survey_from(w, network=True, pips=True):
     """[(kind, name, want, state, problem)] where problem is None when all is well."""
-    w, fam = wanted(args), family()
+    fam = family()
     if not pips:
         w["pips"] = {}
     rows = []
@@ -503,15 +561,206 @@ def hosts(args):
     return 1 if any(r[4] for r in rows) else 0
 
 
+# -- shared VMs (vms run) ----------------------------------------------------------------------
+
+def vm_folder(vm):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", vm) or vm.startswith("."):
+        raise Bad(f"{vm!r} isn't a VM's name: letters, digits, '-', '_' and '.'")
+    return os.path.join(HOME, "vms", vm)
+
+
+def vm_env(vm):
+    """The VM's vm.env as a dict, with VM_SSH_KEY and VM_KNOWN_HOSTS made absolute."""
+    folder = vm_folder(vm)
+    path = os.path.join(folder, "vm.env")
+    if not os.path.exists(path):
+        raise Bad(f"no {path} (README.md, \"vm.env\")")
+    env = {}
+    for line in open(path):
+        m = re.match(r"\s*([A-Z_][A-Z0-9_]*)=(.*)$", line)
+        if m:
+            v = m.group(2).strip()
+            env[m.group(1)] = shlex.split(v)[0] if v else ""
+    for k in ("VM_SSH_PORT", "VM_SSH_USER", "VM_SSH_KEY"):
+        if not env.get(k):
+            raise Bad(f"{path} sets no {k}")
+    env.setdefault("VM_SSH_HOST", "127.0.0.1")
+    env.setdefault("VM_KNOWN_HOSTS", "known_hosts")
+    for k in ("VM_SSH_KEY", "VM_KNOWN_HOSTS"):
+        env[k] = os.path.join(folder, env[k])
+    return env
+
+
+def vm_claims(vm):
+    """[(project, needs)] from the claim files beside the VM's folder; an empty claim (vms claim)
+    needs nothing."""
+    d = os.path.join(HOME, "vms")
+    out = []
+    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if not f.startswith(vm + ".") or "." in f[len(vm) + 1:] or f[len(vm) + 1:] in ("", "lock"):
+            continue
+        with open(os.path.join(d, f)) as h:
+            text = h.read().strip()
+        try:
+            needs = json.loads(text)["needs"] if text else {}
+        except (json.JSONDecodeError, KeyError, TypeError):
+            raise Bad(f"{os.path.join(d, f)}: not a claim vms run wrote; claim again or delete it")
+        out.append((f[len(vm) + 1:], needs))
+    return out
+
+
+def merge_os(vm, claims):
+    """The one guest every claimant can live with: the same family, name and version, the highest
+    min and lowest max of the build. A Clash when there isn't one."""
+    out = None
+    for project, needs in claims:
+        o = needs.get("os")
+        if not o:
+            continue
+        if out is None:
+            out = {"from": [], "why": []}
+        for k in ("family", "name", "version"):
+            if k in o:
+                if k in out and out[k] != o[k]:
+                    raise Clash(f"{vm}: {', '.join(out['from'])} need{'s' if len(out['from']) == 1 else ''} "
+                                f"{k} {out[k]!r}, {project} needs {o[k]!r}")
+                out[k] = o[k]
+        for bound in ("min", "max", "pin"):
+            if bound not in o:
+                continue
+            if bound not in out or out[bound] == o[bound]:
+                out[bound] = o[bound]
+            elif bound == "pin":
+                raise Clash(f"{vm}: build pinned to {out['pin']} ({', '.join(out['from'])}) and to {o['pin']} ({project})")
+            else:
+                pick = max if bound == "min" else min
+                out[bound] = pick(out[bound], o[bound], key=lambda v: _Key(v, pipvercmp))
+        out["from"].append(project)
+        out["why"].append(o["why"])
+        lo, hi = out.get("pin", out.get("min")), out.get("pin", out.get("max"))
+        if lo and hi and pipvercmp(lo, hi) > 0:
+            raise Clash(f"{vm}: build at least {lo} and at most {hi} ({', '.join(out['from'])})")
+    return out
+
+
+def os_text(o):
+    parts = [o.get("name", o["family"]), o.get("version", "")]
+    spec = spec_text(o).replace("==", "build ").replace(">=", "build >= ").replace("<=", "build <= ")
+    return " ".join(p for p in parts + [spec] if p) + f"  [{', '.join(o['from'])}]"
+
+
+def vm_claim(args):
+    if len(args) != 2:
+        raise Bad("usage: deps vm-claim VM DIR")
+    vm, d = args
+    folder = os.path.abspath(d)
+    data = load(folder)
+    project = data.get("project")
+    if not project or not re.fullmatch(r"[A-Za-z0-9_-]+", project) or project == "lock":
+        raise Bad(f"{folder}/.coworker/deps.json: claiming a VM needs \"project\": the name it claims under")
+    vf = vm_folder(vm)
+    if not os.path.isdir(vf):
+        raise Bad(f"no VM {vm} in {os.path.dirname(vf)}")
+    needs = data.get("vms", {}).get(vm, {})
+    path = os.path.join(os.path.dirname(vf), f"{vm}.{project}")
+    with open(path + ".new", "w") as f:
+        json.dump({"project": project, "dir": folder, "needs": needs}, f, indent=2)
+        f.write("\n")
+    os.replace(path + ".new", path)
+    remember(folder, project)
+    claims = vm_claims(vm)
+    o = merge_os(vm, claims)                     # a Clash stops here, before anything runs
+    # what using the VM takes: coworker's own needs and every claimant's host needs for this VM.
+    # The project's other needs (its own tests', say) only get a mention: this run doesn't use them.
+    sources = [("coworker", load(HOME))] if os.path.exists(os.path.join(HOME, ".coworker", "deps.json")) else []
+    sources += [(f"{p}, for {vm}", n) for p, n in claims if any(n.get(k) for k in KEYS)]
+    left = [r for r in survey_from(wanted_from(sources), network=False) if r[4]]
+    others = [r for r in survey_from(wanted_from([(project, data)]), network=False) if r[4]]
+    print(f"{project} claims {vm}" + (f"; its projects need {os_text(o)}" if o else ""))
+    if others:
+        print(f"  (the host lacks {len(others)} of {project}'s other needs, which this run doesn't use: deps check {folder})")
+    if left:
+        print(f"the host is missing what using {vm} needs:")
+        show(left)
+        print(f"  'deps install {folder}' installs the pips; host packages: {SUDO_HINT}")
+        return 1
+    return 0
+
+
+def ssh_argv(env, command):
+    return [SSH, "-i", env["VM_SSH_KEY"], "-p", str(env["VM_SSH_PORT"]), "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={env['VM_KNOWN_HOSTS']}",
+            "-o", "ConnectTimeout=5", f"{env['VM_SSH_USER']}@{env['VM_SSH_HOST']}", command]
+
+
+GUEST_QUERY = {
+    # build (numbers only) | the version people call it | the product's name
+    "windows": ("powershell -NoProfile -NonInteractive -Command -",
+                "$v = [Environment]::OSVersion.Version\n"
+                "$c = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'\n"
+                "$n = (Get-CimInstance Win32_OperatingSystem).Caption -replace '^Microsoft ', ''\n"
+                "Write-Output (\"{0}.{1}.{2}.{3}|{4}|{5}\" -f $v.Major, $v.Minor, $v.Build, $c.UBR, $c.DisplayVersion, $n)\n"),
+    "linux": ("sh -s", '. /etc/os-release; echo "${VERSION_ID}|${VERSION_ID}|${NAME}"\n'),
+}
+
+
+def vm_guest(args):
+    wait = 0.0
+    if "--wait" in args:
+        i = args.index("--wait")
+        wait = float(args[i + 1])
+        args = args[:i] + args[i + 2:]
+    if len(args) != 1:
+        raise Bad("usage: deps vm-guest VM [--wait SECONDS]")
+    vm = args[0]
+    env = vm_env(vm)
+    claims = vm_claims(vm)
+    o = merge_os(vm, claims)
+    deadline, last = time.monotonic() + wait, ""
+    while True:
+        r = subprocess.run(ssh_argv(env, "echo up"), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if r.returncode == 0:
+            break
+        last = (r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1]
+        if time.monotonic() >= deadline:
+            raise Unmet(f"{vm}: no SSH at {env['VM_SSH_USER']}@{env['VM_SSH_HOST']}:{env['VM_SSH_PORT']}"
+                        f"{f' after {wait:.0f} s' if wait else ''}: {last}")
+        time.sleep(min(5.0, max(0.1, deadline - time.monotonic())))
+    if not o:
+        print(f"{vm}: answers; its projects state no OS needs")
+        return 0
+    command, script = GUEST_QUERY[o["family"]]
+    r = subprocess.run(ssh_argv(env, command), input=script, capture_output=True, text=True)
+    out = [l for l in r.stdout.replace("\r", "").splitlines() if l.count("|") == 2]
+    if r.returncode != 0 or not out:
+        raise Unmet(f"{vm}: couldn't ask the guest its OS ({o['family']}): {r.stderr.strip() or r.stdout.strip()}")
+    build, version, name = out[-1].split("|")
+    have = f"{name} {version} (build {build})"
+    wrong = []
+    if o.get("name") and o["name"].lower() not in name.lower():
+        wrong.append(f"not {o['name']}")
+    if o.get("version") and o["version"] != version:
+        wrong.append(f"version {version}, not {o['version']}")
+    miss = in_range(build, o, pipvercmp)
+    if miss:
+        wrong.append(f"build {build} is {miss}")
+    if wrong:
+        raise Unmet(f"{vm} runs {have}: {'; '.join(wrong)}. Its projects need {os_text(o)}: "
+                    f"{'; '.join(o['why'])}")
+    print(f"{vm} runs {have}: meets {os_text(o)}")
+    return 0
+
+
 def main(argv):
-    if not argv or argv[0] not in ("check", "install", "hosts"):
+    if not argv or argv[0] not in ("check", "install", "hosts", "vm-claim", "vm-guest"):
         print(USAGE, file=sys.stderr)
         return 2
     try:
-        return {"check": check, "install": install, "hosts": hosts}[argv[0]](argv[1:])
+        return {"check": check, "install": install, "hosts": hosts,
+                "vm-claim": vm_claim, "vm-guest": vm_guest}[argv[0]](argv[1:])
     except Bad as e:
         print(f"deps: {e}", file=sys.stderr)
-        return 2
+        return e.code
 
 
 if __name__ == "__main__":
