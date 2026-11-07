@@ -102,5 +102,11 @@
       "host": "definitionupdates.microsoft.com",
       "why": "vms update: Microsoft Defender's definition updates, which Windows Update offers too"
     }
+  ],
+  "container_images": [
+    {
+      "image": "curlimages/curl:8.11.1",
+      "why": "downloads fetch: reaches a server this host can't through a container (libexec/downloads)"
+    }
   ]
 }
