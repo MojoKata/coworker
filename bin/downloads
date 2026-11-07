@@ -1,0 +1,150 @@
+#!/bin/sh
+# downloads: the machine's shared downloads (installer ISOs and other big files), in
+# $COWORKER_HOME/downloads (COWORKER_HOME is ~/coworker unless set). README.md, "Downloads".
+#
+#   downloads fetch   FILE PROJECT URL SHA_URL   download FILE, check its SHA-256, claim it
+#   downloads claim   FILE PROJECT               PROJECT needs FILE
+#   downloads release FILE PROJECT               PROJECT is done with FILE; the last release removes it
+#   downloads list    [--verify]                 every file, its size and claims (--verify: its SHA-256)
+#
+# Beside each FILE: FILE.sha256 ("<hash>  <file>", what sha256sum -c reads), an empty FILE.<project>
+# per project that claims it, and while it's fetched FILE.part and FILE.lock.
+set -eu
+DIR=${COWORKER_HOME:-$HOME/coworker}/downloads
+USAGE="usage: downloads fetch FILE PROJECT URL SHA_URL | claim FILE PROJECT | release FILE PROJECT | list [--verify]"
+usage() { echo "$USAGE" >&2; exit 2; }
+
+meta() {        # meta SUFFIX: true when SUFFIX is one of the folder's own, not a project's claim
+    case $1 in sha256|sha256sum|sha256sum.txt|part|lock|bad) return 0 ;; *) return 1 ;; esac
+}
+project() {     # project NAME: exit 2 unless NAME can be a project's name
+    case $1 in ''|*[!A-Za-z0-9_-]*) echo "downloads: a project name is letters, digits, - and _" >&2; exit 2 ;; esac
+    if meta "$1"; then echo "downloads: '$1' can't be a project name" >&2; exit 2; fi
+}
+claims_of() {   # claims_of FILE: the projects that claim FILE, each after a space
+    out=""
+    for f in "$DIR/$1".*; do
+        [ -f "$f" ] && [ ! -s "$f" ] || continue
+        s=${f#"$DIR/$1".}
+        case $s in *.*) continue ;; esac
+        meta "$s" || out="$out $s"
+    done
+    echo "$out"
+}
+
+claim() {
+    [ $# -ge 2 ] || usage
+    F=$(basename "$1"); P=$2
+    project "$P"
+    mkdir -p "$DIR"
+    touch "$DIR/$F.$P"
+    if [ -f "$DIR/$F" ]; then echo "$P claims $F"; else echo "$P claims $F, not here yet: fetch it into $DIR"; fi
+}
+
+release() {
+    [ $# -ge 2 ] || usage
+    F=$(basename "$1"); P=$2
+    rm -f "$DIR/$F.$P"
+    left=$(claims_of "$F")
+    if [ -z "$left" ]; then
+        rm -f "$DIR/$F" "$DIR/$F.sha256" "$DIR/$F.sha256sum.txt" "$DIR/$F.part" "$DIR/$F.bad" "$DIR/$F.lock"
+        echo "$P released $F; no project claims it, so it's removed"
+    else
+        echo "$P released $F; kept, claimed by$left"
+    fi
+}
+
+list() {
+    [ -d "$DIR" ] || { echo "no $DIR"; return 0; }
+    names=$(for f in "$DIR"/*; do
+                [ -f "$f" ] || continue
+                n=${f##*/}
+                case $n in *.part) echo "${n%.part}"; continue ;; *.sha256sum.txt) continue ;; esac
+                s=${n##*.}
+                [ "$s" != "$n" ] && meta "$s" && continue
+                if [ ! -s "$f" ] && [ "$s" != "$n" ]; then echo "${n%."$s"}"; else echo "$n"; fi
+            done | sort -u)
+    for i in $names; do
+        c=$(claims_of "$i")
+        if [ -f "$DIR/$i" ]; then size=$(du -h "$DIR/$i" | cut -f1)
+        elif [ -f "$DIR/$i.part" ]; then size="not here yet, $(du -h "$DIR/$i.part" | cut -f1) downloaded"
+        else size="not here yet"; fi
+        v=""
+        if [ "${1:-}" = --verify ] && [ -f "$DIR/$i" ]; then
+            if [ -f "$DIR/$i.sha256" ] && (cd "$DIR" && sha256sum -c --status "$i.sha256" 2>/dev/null); then v=" | SHA-256 ok"
+            else v=" | SHA-256 doesn't match, or no <file>.sha256 sha256sum can read"; fi
+        fi
+        if [ -n "$c" ]; then echo "$i | $size | claimed by$c$v"; else echo "$i | $size | unclaimed$v"; fi
+    done
+}
+
+CURL="-fsSL --retry 5 --retry-delay 5 --connect-timeout 20 --speed-time 60 --speed-limit 10000"
+get() {         # get URL OUT [-C -]: here, or through a container where this machine can't reach the host
+    rc=0
+    # shellcheck disable=SC2086
+    curl $CURL ${3:-} -o "$2" "$1" || rc=$?
+    case $rc in 6|7|28|35) ;; *) return $rc ;; esac
+    command -v docker >/dev/null || return $rc
+    echo "this machine can't reach $(echo "$1" | cut -d/ -f3) (curl exit $rc); fetching through a container"
+    rc=0
+    # shellcheck disable=SC2086
+    docker run --rm --user "$(id -u):$(id -g)" -v "$DIR:/d" -w /d curlimages/curl:8.11.1 $CURL ${3:-} -o "$2" "$1" || rc=$?
+    return $rc
+}
+
+fetch() {       # fetch FILE PROJECT URL SHA_URL: resumes a stopped download; one fetch of FILE at a time
+    [ $# -ge 4 ] || usage
+    F=$(basename "$1"); P=$2; URL=$3; SHAURL=$4
+    project "$P"
+    mkdir -p "$DIR"
+    DIR=$(cd "$DIR" && pwd)
+    cd "$DIR"
+    exec 9>"$F.lock"
+    flock -n 9 || { echo "another fetch of $F is running; waiting for it"; flock 9; }
+
+    # the expected SHA-256: SHA_URL holds the one hash, or a list naming FILE (a mirror's sha256sum.txt)
+    get "$SHAURL" "$F.sha256.tmp" || { rm -f "$F.sha256.tmp"; echo "downloads: couldn't fetch $SHAURL" >&2; exit 1; }
+    want=$(awk -v f="$F" '{n = $2; sub(/^\*/, "", n)} NF == 1 {print $1; exit} n == f {print $1; exit}' "$F.sha256.tmp")
+    rm -f "$F.sha256.tmp"
+    echo "$want" | grep -Eq '^[0-9a-fA-F]{64}$' || { echo "downloads: no SHA-256 for $F in $SHAURL" >&2; exit 1; }
+    printf '%s  %s\n' "$want" "$F" > "$F.sha256"
+
+    if [ -f "$F" ]; then
+        if sha256sum -c --status "$F.sha256"; then claim "$F" "$P"; return 0; fi
+        echo "$F is here but doesn't match its SHA-256; downloading it again (the old copy is $F.bad)"
+        mv "$F" "$F.bad"
+    fi
+
+    if [ -f "$F.part" ]; then echo "resuming $F from $(du -h "$F.part" | cut -f1)"; else echo "downloading $F"; fi
+    before=$(stat -c %s "$F.part" 2>/dev/null || echo 0)
+    rc=0
+    get "$URL" "$F.part" "-C -" || rc=$?
+    after=$(stat -c %s "$F.part" 2>/dev/null || echo 0)
+    # a complete .part makes the resume fail (416, nothing left to send): the hash says whether it's whole
+    got=$(sha256sum "$F.part" 2>/dev/null | cut -d' ' -f1)
+    if [ "$got" != "$want" ]; then
+        if [ "$rc" != 0 ] && [ "$after" -gt "$before" ]; then
+            echo "downloads: $F stopped (curl exit $rc) at $(du -h "$F.part" | cut -f1); run the same command to resume" >&2
+        elif [ "$rc" != 0 ] && [ "$before" -gt 0 ]; then
+            echo "downloads: $F.part can't be resumed (curl exit $rc, no progress): it may be whole but corrupt; delete it to start over" >&2
+        elif [ "$rc" != 0 ]; then
+            echo "downloads: $F couldn't be fetched (curl exit $rc) from $URL" >&2
+        else
+            echo "downloads: $F downloaded, but its SHA-256 doesn't match $SHAURL; delete $F.part to start over" >&2
+        fi
+        exit 1
+    fi
+    mv "$F.part" "$F"
+    echo "$F: SHA-256 matches"
+    claim "$F" "$P"
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+    fetch) fetch "$@" ;;
+    claim) claim "$@" ;;
+    release) release "$@" ;;
+    list) list "$@" ;;
+    *) echo "$USAGE" >&2; exit 2 ;;
+esac
