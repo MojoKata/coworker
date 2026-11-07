@@ -29,7 +29,7 @@ HOME = os.environ.get("COWORKER_HOME") or os.path.join(os.path.expanduser("~"), 
 PYTHON = os.environ.get("COWORKER_PYTHON", "python3")
 USAGE = "usage: deps check [--no-network] [DIR...] | install [DIR...] | hosts [DIR...]"
 KEYS = {"host": "package", "pips": "pip", "network": "host"}
-ENTRY_KEYS = {"platform", "min", "max", "pin", "why", "port", "tls"}
+ENTRY_KEYS = {"platform", "min", "max", "pin", "why", "port", "probe"}
 
 
 class Bad(Exception):
@@ -164,21 +164,31 @@ def has_pip():
         return False
 
 
-def answers(host, port, tls=True, timeout=float(os.environ.get("COWORKER_NET_TIMEOUT", "5"))):
-    """(True, ms) if host:port answers, else (False, why). With tls (the default), a TLS handshake
-    naming the host must finish too: a firewall that filters on the TLS server name lets the TCP
-    connection open and then never answers the handshake, and only this shows it."""
+def default_probe(port):
+    return "http" if port == 80 else "tls"
+
+
+def answers(host, port, probe="tls", timeout=float(os.environ.get("COWORKER_NET_TIMEOUT", "5"))):
+    """(True, ms) if host:port answers as `probe` says, else (False, why). A firewall that filters
+    by name lets the connection open and then never answers, so each probe goes as far as the real
+    client does: tls finishes a handshake naming the host, http gets a status line back for a
+    request naming it, tcp only connects."""
     t, stage = time.monotonic(), "connecting"
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
-            stage = "the TLS handshake"
-            if tls:
+            s.settimeout(timeout)
+            if probe == "tls":
+                stage = "the TLS handshake"
                 ctx = ssl.create_default_context()
                 if os.environ.get("COWORKER_TLS_CA"):
                     ctx.load_verify_locations(os.environ["COWORKER_TLS_CA"])
-                s.settimeout(timeout)
                 with ctx.wrap_socket(s, server_hostname=host):
                     pass
+            elif probe == "http":
+                stage = "an HTTP request"
+                s.sendall(f"HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+                if not s.recv(5).startswith(b"HTTP"):
+                    return False, "not an HTTP answer"
             return True, f"{(time.monotonic() - t) * 1000:.0f} ms"
     except socket.gaierror:
         return False, "no such host (DNS)"
@@ -225,8 +235,10 @@ def load(folder):
                 raise Bad(f"{where} ({e[name_key]}): a pin with a min or max")
             if kind == "network" and set(e) & {"min", "max", "pin"}:
                 raise Bad(f"{where} ({e[name_key]}): a host has no version")
-            if kind != "network" and set(e) & {"port", "tls"}:
-                raise Bad(f"{where} ({e[name_key]}): only a network host has a port or tls")
+            if kind != "network" and set(e) & {"port", "probe"}:
+                raise Bad(f"{where} ({e[name_key]}): only a network host has a port or probe")
+            if e.get("probe", "tls") not in ("tls", "http", "tcp"):
+                raise Bad(f"{where} ({e[name_key]}): probe is tls, http or tcp")
     return data
 
 
@@ -259,7 +271,9 @@ def wanted(args):
                 taken.add(name)
                 w = out[kind].setdefault(name, {"from": [], "why": []})
                 if kind == "network":
-                    w["tls"] = w.get("tls", True) and e.get("tls", True)
+                    probe = e.get("probe", default_probe(e.get("port", 443)))
+                    if w.setdefault("probe", probe) != probe:
+                        raise Bad(f"{name}: probed as {w['probe']} and as {probe} ({', '.join(w['from'])})")
                 w["from"].append(label)
                 w["why"].append(e["why"])
                 for bound in ("min", "max", "pin"):
@@ -306,7 +320,7 @@ def survey(args, network=True):
         names = sorted(w["network"])
         with ThreadPoolExecutor(16) as pool:
             results = list(pool.map(lambda n: answers(n.rsplit(":", 1)[0], int(n.rsplit(":", 1)[1]),
-                                                      w["network"][n]["tls"]), names))
+                                                      w["network"][n]["probe"]), names))
         for name, (ok, how) in zip(names, results):
             rows.append(("net", name, w["network"][name], how, None if ok else "unreachable"))
     return rows

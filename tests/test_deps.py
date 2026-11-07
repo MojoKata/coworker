@@ -140,7 +140,8 @@ class Check(Case):
                           ({"hosts": []}, "unknown key 'hosts'"),
                           ({"host": [{"package": "a", "why": "w", "pin": "1", "min": "1"}]}, "a pin with a min"),
                           ({"network": [{"host": "x", "why": "w", "min": "1"}]}, "a host has no version"),
-                          ({"pips": [{"pip": "x", "why": "w", "port": 1}]}, "only a network host")):
+                          ({"pips": [{"pip": "x", "why": "w", "port": 1}]}, "only a network host"),
+                          ({"network": [{"host": "x", "why": "w", "probe": "ping"}]}, "probe is tls, http or tcp")):
             p = self.project("bad", bad)
             self.assertIn(said, self.deps("check", "--no-network", p, rc=2).stderr, bad)
 
@@ -195,8 +196,8 @@ class Install(Case):
 
 
 class Network(Case):
-    """Local servers: one that speaks TLS, one that accepts and never answers (what a firewall that
-    filters on the TLS server name looks like), and a closed port."""
+    """Local servers: one that speaks TLS, one that answers HTTP, one that accepts and never answers
+    (what a firewall that filters by name looks like), and a closed port."""
 
     @classmethod
     def setUpClass(cls):
@@ -210,7 +211,7 @@ class Network(Case):
         ctx.load_cert_chain(cert, key)
         cls.socks = []
 
-        def serve(tls):
+        def serve(kind):
             s = socket.socket()
             s.bind(("127.0.0.1", 0))
             s.listen(8)
@@ -222,16 +223,22 @@ class Network(Case):
                         c, _ = s.accept()
                     except OSError:
                         return
-                    if tls:
+                    if kind == "tls":
                         try:
                             ctx.wrap_socket(c, server_side=True).close()
                         except (ssl.SSLError, OSError):
                             c.close()
-                    # else: keep it open and say nothing
+                    elif kind == "http":
+                        try:
+                            c.recv(1024)
+                            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        finally:
+                            c.close()
+                    # silent: keep it open and say nothing
             threading.Thread(target=loop, daemon=True).start()
             return s.getsockname()[1]
 
-        cls.tls_port, cls.silent_port = serve(True), serve(False)
+        cls.tls_port, cls.silent_port, cls.http_port = serve("tls"), serve("silent"), serve("http")
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         cls.closed_port = s.getsockname()[1]
@@ -248,16 +255,32 @@ class Network(Case):
             {"host": "localhost", "port": self.tls_port, "why": "speaks TLS"},
             {"host": "localhost", "port": self.silent_port, "why": "accepts, then silence"},
             {"host": "localhost", "port": self.closed_port, "why": "closed"},
-            {"host": "localhost", "port": self.silent_port, "tls": False, "why": "never matched: same host:port"}]})
+            {"host": "localhost", "port": self.silent_port, "probe": "tcp", "why": "never read: same host:port"}]})
         res = self.deps("hosts", p, rc=1, COWORKER_TLS_CA=str(self.cert), COWORKER_NET_TIMEOUT="1")
         lines = {l.split()[0]: l for l in res.stdout.splitlines()}
         self.assertIn(" ok ", lines[f"localhost:{self.tls_port}"])
         self.assertIn("no answer to the TLS handshake", lines[f"localhost:{self.silent_port}"])
         self.assertIn("UNREACHABLE", lines[f"localhost:{self.closed_port}"])
 
-    def test_a_plain_tcp_service_can_say_tls_false(self):
-        p = self.project("one", {"network": [{"host": "localhost", "port": self.silent_port, "tls": False, "why": "not TLS"}]})
+    def test_an_http_host_answers_only_if_a_request_gets_a_status_line(self):
+        p = self.project("one", {"network": [{"host": "localhost", "port": self.silent_port, "probe": "http", "why": "silent"},
+                                             {"host": "localhost", "port": self.http_port, "probe": "http", "why": "answers"}]})
+        lines = {l.split()[0]: l for l in self.deps("hosts", p, rc=1, COWORKER_NET_TIMEOUT="1").stdout.splitlines()}
+        self.assertIn("no answer to an HTTP request", lines[f"localhost:{self.silent_port}"])
+        self.assertIn(" ok ", lines[f"localhost:{self.http_port}"])
+
+    def test_port_80_is_probed_with_http_unless_it_says_otherwise(self):
+        self.assertEqual(load_module().default_probe(80), "http")
+        self.assertEqual(load_module().default_probe(443), "tls")
+
+    def test_a_plain_tcp_service_says_probe_tcp(self):
+        p = self.project("one", {"network": [{"host": "localhost", "port": self.silent_port, "probe": "tcp", "why": "not TLS"}]})
         self.deps("hosts", p, rc=0, COWORKER_NET_TIMEOUT="1")
+
+    def test_two_projects_probing_one_host_two_ways_is_a_clash(self):
+        a = self.project("a", {"network": [{"host": "h", "port": 8080, "probe": "http", "why": "a"}]})
+        b = self.project("b", {"network": [{"host": "h", "port": 8080, "probe": "tcp", "why": "b"}]})
+        self.assertIn("probed as http and as tcp", self.deps("hosts", a, b, rc=2).stderr)
 
     def test_a_certificate_that_doesnt_verify_is_a_problem(self):
         p = self.project("one", {"network": [{"host": "localhost", "port": self.tls_port, "why": "self-signed"}]})

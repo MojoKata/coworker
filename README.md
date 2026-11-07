@@ -223,7 +223,8 @@ counts too.
   ],
   "network": [
     { "host": "github.com", "why": "the project's releases" },
-    { "host": "internal.example", "port": 22, "tls": false, "why": "an SSH service" }
+    { "host": "deb.debian.org", "port": 80, "why": "apt in the containers, over plain HTTP" },
+    { "host": "internal.example", "port": 22, "probe": "tcp", "why": "an SSH service" }
   ]
 }
 ```
@@ -233,7 +234,7 @@ counts too.
 | `project` | the project's name (as it claims things); labels its needs in the output |
 | `host` | host packages: `package` is the distribution's name for it (`dnf`/`apt`) |
 | `pips` | pips in the system Python (`python3`): `pip` is the distribution name (`pillow`, not `PIL`) |
-| `network` | hosts it reaches: `host`, `port` (443), `tls` (true: a TLS handshake naming the host must finish) |
+| `network` | hosts it reaches: `host`, `port` (443), `probe` (how it's tried: `tls`, or `http` on port 80; `tcp` for anything else) |
 | `platform` | which machines an entry is for: a glob over `ID-VERSION_ID` from `/etc/os-release` (`rocky-10.2`, `ubuntu-24.04`); every machine if left out |
 | `min`, `max` | the versions it accepts, inclusive; `pin`, exactly one (not with `min` or `max`) |
 | `why` | required: what needs it, so nobody has to rediscover the reason |
@@ -248,9 +249,10 @@ Rules:
   (exit 2). The agent working at the time sorts it out with the machine's owner.
 - **Versions** compare as the package manager does (rpm's or dpkg's rules), without the packaging
   revision (`2.15.0-7.el10` meets a pin of `2.15.0`); pips by their release numbers.
-- **A host answers** when a TLS handshake that names it finishes. A firewall that filters by the
-  TLS server name lets the connection open and then never answers, so a connection alone proves
-  nothing. A service that isn't TLS says `"tls": false`.
+- **A host answers** when it gets as far as its real client would: `tls`, a TLS handshake naming
+  it finishes; `http`, a request naming it gets a status line back; `tcp`, the connection opens. A
+  firewall that filters by name lets the connection open and then never answers, so a connection
+  alone proves nothing for HTTPS or HTTP.
 - **No `sudo` here.** `deps install` prints what to run; the machine's owner runs the `sudo` part.
 
 ## Tests
