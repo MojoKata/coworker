@@ -231,6 +231,8 @@ ones, and a rebuild keeps them.
     vms lock    VM PROJECT [--no-wait] -- COMMAND [ARG...]
     vms env     VM
     vms list
+    vms create  VM [--yes]
+    vms update  VM
 
 - **`run`** is the one call a project's script makes: `DIR` is the project's checkout. It
   1. claims the VM for the project (named after its checkout directory) with what the project needs of the VM
@@ -405,14 +407,45 @@ A project's `deps.json` says, under `"vms"`, what it needs of each shared VM it 
 
 | Key | What it is |
 |---|---|
-| `os` | what the guest must be: `family` (`windows` or `linux`: how it's asked), `name` (contained in the guest's product name), `version` (the version people call it: `22H2`, `24.04`), and `min`, `max` or `pin` of its build (`10.0.19045.6456` on Windows, `VERSION_ID` on Linux); `why` |
+| `os` | what the guest must be: `family` (`windows` or `linux`: how it's asked), `name` (contained in the guest's product name), `version` (the version people call it: `22H2`, `24.04`), and `min`, `max` or `pin` of its build (`10.0.19045.6456` on Windows, `VERSION_ID` on Linux); `updated_within_days`, a whole number: `vms update` must have left it with nothing to install within that many days (protocol 4.1); `why` |
 | `host`, `pips`, `network` | what the host needs to use the VM (as at the top level of `deps.json`) |
 
 `vms run` writes the project's entry into its claim (`<vm>.<project>`, beside the VM's folder), so
 the merge sees every project that uses the VM without knowing where their checkouts are. Merging:
 the same `family` and `version` (else a clash), names one inside the other (`Windows 10` and
 `Windows 10 Pro`: the longer counts), the highest `min` and the lowest `max` of
-the build, one `pin`; the host needs as at the top level.
+the build, one `pin`, the smallest `updated_within_days`; the host needs as at the top level.
+
+## VM recipes
+
+A shared VM that coworker can build has a **recipe** in this repository, `vms/<vm>/`, installed as
+`$COWORKER_HOME/recipes/<vm>/` (protocol 4.1). A recipe is everything the VM is made from, pinned:
+`recipe.env` (the image by its digest, the Windows version, size, account and ports, and the
+OpenSSH zip by its SHA-256), `oem/` (what runs at the end of setup), `update.ps1`, and the helpers
+copied into the VM's folder (`ssh.sh`, `scp.sh`, `shot.sh`, `keys.sh`). A change to a recipe is a
+change to every project's test machine: the machine's owner's call, through a PR here.
+
+    vms create VM [--yes]
+    vms update VM
+
+- **`create`** builds the VM from its recipe, replacing the one in `vms/<vm>/`, under the VM's
+  lock. Without `--yes` it says what it would replace and for which projects, and exits 3: it's a
+  human's call (`COWORKER_UNATTENDED=1` counts as yes). It keeps the folder's `password.txt` and
+  `vm_key` (or makes them), checks the OpenSSH zip, writes `vm.env`, keeps the old disk as
+  `storage-<date>-old` (delete it once the new VM works), starts the container and waits for SSH
+  (`COWORKER_VM_INSTALL_WAIT`, 2 h). It then writes `known_hosts` from the host keys the guest says
+  it has, as they answer on the port, runs `update`, notes the build in `history`, and stops the VM.
+  The VM's own files that aren't in the recipe (a project's helper scripts, its `README.md`) stay.
+- **`update`** runs Windows Update in the guest until nothing is left, under the VM's lock: it
+  starts the VM if it's down (and stops it after), runs `update.ps1` as SYSTEM through a scheduled
+  task (the update API refuses an SSH session), restarts the guest when an update asks, and goes
+  round again (at most 8 rounds; each may take up to 3 h, `COWORKER_VM_UPDATE_WAIT`). When a round
+  finds nothing to install it writes `<vm>/updated` (the day and the build), which a project's
+  `updated_within_days` need reads. Exit 1 when updates keep failing (`C:\coworker\update.log` in
+  the guest says which).
+
+Both reach Microsoft (`deps hosts` lists the hosts): `create` for the ISO, unless
+`downloads/<ISO>` holds it, and `update` for Windows Update.
 
 ## Tests
 
