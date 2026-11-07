@@ -5,12 +5,14 @@ ISOs and other large downloads, virtual machines) without stepping on each other
 machine must have installed and reachable for them. The shared thing
 records who uses it, so no project's documents need to name another.
 
-This repository is the source. The commands are **installed** from it into the machine's coworker
-home, which also holds the shared things; the checkout itself never holds them.
+This repository is the source. Each project carries it as a **git submodule** at `coworker/`, and
+the commands are **installed** from there into the machine's coworker home, which also holds the
+shared things. A project calls coworker through its submodule, which checks the installed coworker
+and hands the call to it ([Protocol](#protocol)).
 
 | Where | What |
 |---|---|
-| a checkout of this repository | the source: `bin/`, `install.sh`, `tests/`, this README |
+| a project's `coworker/` (a submodule of this repository) | the launcher (`bin/coworker`, and `bin/deps`, `bin/vms`, `bin/downloads` linked to it), what it installs (`libexec/`, `install.sh`), and `PROTOCOL` |
 | `$COWORKER_HOME` (`~/coworker` unless set) | the installed commands and the shared things |
 | `$COWORKER_HOME/bin/downloads` | shares large downloads ([Downloads](#downloads)) |
 | `$COWORKER_HOME/bin/vms` | shares virtual machines ([VMs](#vms)) |
@@ -20,35 +22,114 @@ home, which also holds the shared things; the checkout itself never holds them.
 | `$COWORKER_HOME/downloads/` | the downloads, with their checksums and claims |
 | `$COWORKER_HOME/vms/` | the VMs' folders, with their claims (each project's needs of the VM) and locks |
 | `$COWORKER_HOME/VERSION` | what's installed (`git describe` of the checkout it came from) |
+| `$COWORKER_HOME/PROTOCOL` | the installed protocol, `MAJOR.MINOR` ([Protocol](#protocol)) |
 
-`COWORKER_HOME` is the only setting. The commands use `${COWORKER_HOME:-$HOME/coworker}` whether
-they run installed or from a checkout.
+`COWORKER_HOME` is the one setting a machine needs; the commands use `${COWORKER_HOME:-$HOME/coworker}`.
+`COWORKER_UNATTENDED=1` is for CI, where there's no human ([A new machine](#a-new-machine)).
 
 ## Installing
 
-    git clone https://github.com/MojoKata/coworker.git && coworker/install.sh
+From any project that carries coworker, and only as a human's call (or on their say-so):
 
-`install.sh` copies `bin/downloads`, `bin/vms` and `bin/deps` into `$COWORKER_HOME/bin` (copies, not
-links) and `.coworker/deps.json` into `$COWORKER_HOME/.coworker/`, writes `VERSION`, and creates `downloads/` and `vms/` if they're missing. It never touches what's in
-them, so updating is `git pull` and `install.sh` again. Versions are this repository's tags.
+    coworker/bin/coworker install [--change]
+
+It runs the submodule's `install.sh`, which copies `libexec/downloads`, `libexec/vms` and
+`libexec/deps` into `$COWORKER_HOME/bin` (copies, not links), `.coworker/deps.json` into
+`$COWORKER_HOME/.coworker/` and `PROTOCOL` beside it, writes `VERSION`, and creates `downloads/` and
+`vms/` if they're missing. It never touches what's in them. Over an install of another protocol it
+needs `--change` ([Protocol](#protocol)); without it, it says what would change for which projects
+and exits 3. No separate clone of coworker is needed; one is only for working on coworker. Versions
+are this repository's tags.
+
 (Versions 1 and 2 of the protocol lived as a `coworker/` folder copied into each project; version 2
-made a run that starts a VM stop it; version 3 added `deps` and a project's `.coworker/deps.json`.)
+made a run that starts a VM stop it; version 3 added `deps` and a project's `.coworker/deps.json`;
+version 4 made `coworker/` a submodule that checks the install and hands over.)
 
 ## In a project
 
 - **Its name.** A project's name is its checkout directory's name (`~/MyProject` claims as
   `MyProject`): letters, digits, `-` and `_`. `deps` and `vms run` take it from the directory; a script
   that calls `downloads` or `vms claim` itself passes the same (`"$(basename "$HERE")"`).
-- **Calling the commands.** A project's scripts call the installed copies, and say how to get them
-  when they're missing:
+- **Carrying coworker.** `git submodule add https://github.com/MojoKata/coworker.git coworker`, and
+  a bump is `git -C coworker checkout <tag>` and a commit. The machine's projects move to a new
+  protocol together ([Protocol](#protocol)).
+- **Calling the commands.** Always through the submodule; never the installed copies directly (they
+  refuse to change shared state for a caller that doesn't say its protocol). The first line of each
+  script:
 
-      CW=${COWORKER_HOME:-$HOME/coworker}
-      [ -x "$CW/bin/vms" ] || { echo "coworker isn't installed: run install.sh from a checkout of MojoKata/coworker" >&2; exit 1; }
+      "$HERE/coworker/bin/deps" register "$HERE"
+
+  then `"$HERE/coworker/bin/vms" ...` and `"$HERE/coworker/bin/downloads" ...`. Nothing else: the
+  submodule finds the install, checks it and says what to do when it's missing or doesn't match.
+  `register` never fails a script, even with nothing installed (a project's own container), so a
+  script that runs itself again in a container needs no check of its own.
+- **Its first step on a machine** is `coworker/bin/coworker status` ([A new machine](#a-new-machine)).
 
 - **What it needs of the machine.** `.coworker/deps.json` in the project's checkout, version-controlled
   with the project ([Dependencies](#dependencies)).
 - **Where it's written down.** The project's own documents say what it claims and why. Nothing here
   names a project.
+
+## Protocol
+
+`PROTOCOL` holds `MAJOR.MINOR`. A minor adds something and keeps every earlier client of the same
+major working; a major changes the shared state or what a command means.
+
+**The handshake.** Every call through a project's submodule reads the installed `PROTOCOL` and:
+
+| Installed vs the project's submodule | Result |
+|---|---|
+| same major, installed minor ≥ the submodule's | hands the call to `$COWORKER_HOME/bin/<command>`, with `COWORKER_CLIENT_PROTOCOL` (the submodule's) and `COWORKER_HOME` |
+| older minor, or another major (or protocol 3, which wrote no `PROTOCOL`) | exit 3: both numbers, the machine's projects, and `coworker/bin/coworker install --change` |
+| nothing installed | `deps register`: one line on stderr, exit 0. Anything else: exit 3 and `coworker/bin/coworker install` |
+
+The installed commands check from their side too: `vms run`, `claim`, `release`, `lock`, `downloads
+fetch`, `claim`, `release`, and `deps register`, `status` refuse (exit 3) a call that doesn't carry a
+protocol they serve. Looking (`list`, `env`, `check`, `hosts`, `install`) is anyone's.
+
+What the launcher reads of an install, `${COWORKER_HOME:-~/coworker}`, its `bin/<command>` and its
+`PROTOCOL`, stays the same in every version, so any launcher can talk to any install.
+
+**Moving to a new protocol.** All the machine's projects move together, with the install, and
+nothing changes the install by itself: the machine's owner bumps each project's submodule, then runs
+`coworker/bin/coworker install --change` once. A project that was missed gets exit 3 and what to do.
+
+**Exit 3** always means "waiting on a human", with the command to run. The commands' other codes:
+1 and 2 for errors, 65, 69 and 75 for VMs ([The command](#the-command)).
+
+## A new machine
+
+    coworker/bin/coworker status [--no-network] [DIR]
+
+is a project's first step on any machine (`DIR`: the project the submodule is in). It does the
+handshake, registers the project, does what needs no human, and lists what's waiting on one, each
+with its command (exit 3; 0 when nothing waits). The rule: what changes what other projects use,
+needs root, or is costly to undo is a human's call; what's read-only or the project's own is
+automated.
+
+| Step | Who |
+|---|---|
+| `git clone --recurse-submodules`, or `git submodule update --init coworker` | automated (the project's own folder) |
+| `coworker status`: the handshake, `deps check` | automated (read-only) |
+| Installing coworker on the machine for the first time | **asked**: the machine joins, and `COWORKER_HOME` is a machine-wide choice |
+| Any change to the installed coworker | **asked** ([Protocol](#protocol)) |
+| `deps register` | automated (adds this project, changes nothing for others) |
+| The project's own `.venv`, build caches, images | automated |
+| Pips (the user's site) and tools (`~/.local/bin`, an SDK, Nix) | **asked**: the machine's projects share them |
+| Host packages (`deps install --sudo`, root) | **the human runs it** |
+| Claiming a VM or download, `vms run` under the lock | automated |
+| Downloading a missing ISO | automated (claimed, and removed with its last claim) |
+| Creating a VM | **asked**: hours and big disks, and the VM is shared |
+| A protocol mismatch | **asked** |
+
+**Unattended (CI).** With `COWORKER_UNATTENDED=1`, set explicitly (never inferred from `CI`), every
+**asked** step is done instead: the launcher installs coworker (with `--change`) rather than exit 3,
+and `status` runs `deps install`, each missing tool's `how`, and the host packages through `sudo -n`
+(which fails rather than prompts). Nothing waits: what still can't be done exits 1. A client's CI:
+
+    - uses: actions/checkout@<sha>
+      with: { submodules: true }
+    - run: COWORKER_UNATTENDED=1 coworker/bin/coworker status
 
 ## Downloads
 
@@ -165,7 +246,7 @@ ones, and a rebuild keeps them.
 
   The exit is `COMMAND`'s otherwise. A script re-runs itself under it:
 
-      [ -n "${COWORKER_VM_LOCKED:-}" ] || exec "$CW/bin/vms" run win10 "$HERE" -- sh "$0" "$@"
+      [ -n "${COWORKER_VM_LOCKED:-}" ] || exec "$HERE/coworker/bin/vms" run win10 "$HERE" -- sh "$0" "$@"
 
 - **`claim`** records that a project needs the VM. A script can run it each time: it's idempotent.
 - **`release`** removes a project's claim. It never deletes a VM: with the last claim gone it says
@@ -174,9 +255,9 @@ ones, and a rebuild keeps them.
   run it waits for (`--no-wait`: exits 75 instead). `COMMAND` sees `COWORKER_VM_LOCKED=<vm>`, so a
   script can re-run itself under it:
 
-      [ -n "${COWORKER_VM_LOCKED:-}" ] || exec "$CW/bin/vms" lock win10 myproject -- "$0" "$@"
+      [ -n "${COWORKER_VM_LOCKED:-}" ] || exec "$HERE/coworker/bin/vms" lock win10 myproject -- "$0" "$@"
 
-- **`env`** prints how to reach the VM, for a script to `eval "$("$CW/bin/vms" env win10)"`:
+- **`env`** prints how to reach the VM, for a script to `eval "$("$HERE/coworker/bin/vms" env win10)"`:
   `VM_HOME` (the VM's folder) and each `vm.env` setting, with the key and known-hosts paths made
   absolute.
 - **`list`** lists each VM, what it is, its claims, and who holds it now.
@@ -223,6 +304,7 @@ packages, which need root and which the machine's owner runs with `sudo`.
     sudo ~/coworker/bin/deps install --sudo [--dry-run] [DIR...]   as root only
     deps hosts   [DIR...]
     deps register DIR
+    deps status  [--no-network] DIR                   through coworker status
 
 - **`check`** lists every need with what's installed and whether it's met, and whether each host
   answers. Exit 1 if anything is missing, out of range or unreachable; 2 if a `deps.json` is wrong or
@@ -250,14 +332,14 @@ packages, which need root and which the machine's owner runs with `sudo`.
   (exit 2 only for a broken `deps.json`): a script that uses a shared VM gets its real check from
   `vms run`, and a project's other needs are for whoever runs `deps check`.
 
-      CW=${COWORKER_HOME:-$HOME/coworker}
-      [ -x "$CW/bin/deps" ] && "$CW/bin/deps" register "$HERE"
+      "$HERE/coworker/bin/deps" register "$HERE"
+
+- **`status`** is what `coworker status` runs after the handshake ([A new machine](#a-new-machine)).
 
 A `DIR` is a project's checkout. Coworker's own `deps.json` (installed with the commands) always
 counts too. Each `DIR` is remembered in `$COWORKER_HOME/projects/<project>` (a file holding the
 checkout's path), so with no `DIR` every project the machine has seen counts: setting up a machine
-is installing coworker, one `deps check` in each project, `deps install`, and the owner's
-`sudo ~/coworker/bin/deps install --sudo` (or, as root, the full path). A remembered
+is `coworker/bin/coworker status` in each project, and what it lists ([A new machine](#a-new-machine)). A remembered
 checkout that's gone is skipped and said; delete its file when the project is.
 
 ### `.coworker/deps.json`
@@ -284,7 +366,7 @@ checkout that's gone is skipped and said; delete its file when the project is.
 | `project` | optional: if present, it must be the checkout directory's name (a project's name is its directory's) |
 | `host` | host packages: `package` is the distribution's name for it (`dnf`/`apt`) |
 | `pips` | pips in the system Python (`python3`): `pip` is the distribution name (`pillow`, not `PIL`) |
-| `tools` | what comes from its own installer, not the package manager (an SDK, Nix): `tool`, found by `command` (on `PATH`) or `path` (`~` allowed), and `how` to install it, which `deps install` prints and never runs |
+| `tools` | what comes from its own installer, not the package manager (an SDK, Nix): `tool`, found by `command` (on `PATH`) or `path` (`~` allowed), and `how` to install it, which `deps install` prints and never runs (`status` runs it only unattended) |
 | `network` | hosts it reaches: `host`, `port` (443), `probe` (how it's tried: `tls`, or `http` on port 80; `tcp` for anything else) |
 | `platform` | which machines an entry is for: a glob over `ID-VERSION_ID` from `/etc/os-release` (`rocky-10.2`, `ubuntu-24.04`); every machine if left out |
 | `min`, `max` | the versions it accepts, inclusive; `pin`, exactly one (not with `min` or `max`) |
@@ -338,4 +420,5 @@ the build, one `pin`; the host needs as at the top level.
 
 Standard library only; they need `sh`, `flock` (util-linux), for `fetch`, `curl`, and for the
 network checks, `openssl` (a throwaway certificate). Each test
-uses a throwaway `COWORKER_HOME`, so they never touch the machine's.
+uses a throwaway `COWORKER_HOME`, so they never touch the machine's. `tests/test_protocol.py` runs the
+launcher from a project holding a copy of this checkout as its `coworker/`.

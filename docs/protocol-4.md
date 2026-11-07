@@ -1,7 +1,8 @@
 # Protocol 4: coworker as a submodule that negotiates with the installed coworker
 
-A plan, for review before any code. It comes from the owner's walk thru on 2026-11-07. Protocol 3,
-the current one, is in the [README](../README.md).
+The plan, from the owner's walk thru on 2026-11-07. It's built as protocol 4.0, and the
+[README](../README.md) is now the reference ("Protocol", "A new machine"); this stays as the record of
+why.
 
 ## What changes
 
