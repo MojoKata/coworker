@@ -227,7 +227,7 @@ class Install(Case):
         py = self.env["COWORKER_PYTHON"]
         self.assertEqual(self.log(), ["python -m pip install --user pillow>=13.0.0"])
         self.assertIn("1 host package(s) need root", res.stdout)
-        self.assertIn("sudo ~/coworker/bin/deps install --sudo", res.stdout)
+        self.assertIn(f"sudo {self.home}/bin/deps install --sudo", res.stdout)
 
     def test_pip_comes_first_when_the_python_has_none(self):
         p = self.project("one", {"pips": [{"pip": "pillow", "why": "w"}]})
@@ -249,7 +249,7 @@ class Install(Case):
         p = self.project("one", {"host": [{"package": "a", "min": "1.2", "why": "w"}]})
         res = self.deps("install", "--sudo", "--dry-run", p, rc=0)
         self.assertEqual(res.stdout.strip(), "dnf install -y 'a >= 1.2'")
-        self.assertIn("# not root: the real run must be: sudo ~/coworker/bin/deps install --sudo", res.stderr)
+        self.assertIn(f"# not root: the real run must be: sudo {self.home}/bin/deps install --sudo", res.stderr)
         self.assertEqual(self.log(), [])
 
     def test_sudo_mode_installs_host_packages_with_ranges_and_pins_then_checks(self):
@@ -289,7 +289,7 @@ class Install(Case):
         res = self.deps("install", "--dry-run", p, rc=0)
         py = self.env["COWORKER_PYTHON"]
         self.assertEqual(res.stdout.splitlines(), [f"{py} -m pip install --user 'pillow>=13.0.0'"])
-        self.assertIn("# as root (sudo ~/coworker/bin/deps install --sudo):\n# dnf install -y 'a >= 1.2'", res.stderr)
+        self.assertIn(f"# as root (sudo {self.home}/bin/deps install --sudo (or that, as root)):\n# dnf install -y 'a >= 1.2'", res.stderr)
         self.assertEqual(self.deps("install", "--sudo", "--dry-run", p, rc=0, **self.ROOT).stdout.strip(), "dnf install -y 'a >= 1.2'")
         self.assertEqual(self.deps("install", "-n", p, rc=0).stdout, res.stdout)        # -n is the short name
         self.assertEqual(self.log(), [])
@@ -304,6 +304,17 @@ class Install(Case):
         p = self.project("one", {"host": [{"package": "a", "why": "w"}]})
         self.assertIn("everything installed", self.deps("install", p, rc=0, FAKE_RPMS="a=1-1").stdout)
         self.assertIn("no host packages", self.deps("install", "--sudo", p, rc=0, FAKE_RPMS="a=1-1", **self.ROOT).stderr)
+
+    def test_an_installed_copy_uses_its_own_home_even_as_a_root_login(self):
+        res = subprocess.run(["sh", str(ROOT / "install.sh")], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        p = self.project("one", {"project": "one", "host": [{"package": "a", "why": "w"}]})
+        self.deps("check", "--no-network", p, rc=1)                       # remembered in self.home
+        env = {k: v for k, v in self.env.items() if k not in ("COWORKER_HOME", "SUDO_USER")}
+        out = subprocess.run([str(self.home / "bin" / "deps"), "install", "--sudo", "--dry-run"], capture_output=True,
+                             text=True, env={**env, "COWORKER_EUID": "0", "HOME": str(self.tmp / "root"),
+                                             "FAKE_RPMS": "curl=8-1 openssh-clients=9-1 python3=3.12-1 util-linux=2-1"})
+        self.assertEqual(out.stdout.strip(), "dnf install -y a", out.stderr)
 
     def test_under_sudo_the_home_is_the_invoking_users(self):
         import pwd

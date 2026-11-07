@@ -231,7 +231,10 @@ packages, which need root and which the machine's owner runs with `sudo`.
 - **`install --sudo`** (as root; it refuses otherwise, except with `--dry-run`, which says so on
   stderr and prints the commands anyway) installs the missing host packages with one
   `dnf install` (or `apt-get install`), checks them again, and writes nothing in the user's home.
-  Under `sudo`, which resets `HOME`, it finds the invoking user's coworker home through `SUDO_USER`.
+  An installed `deps` uses the home it's installed in (`<home>/bin/deps` beside `<home>/VERSION`), so
+  root sees the same projects whether it comes by `sudo` or a root login:
+  `/home/<user>/coworker/bin/deps install --sudo`. (A copy run from a checkout falls back to
+  `SUDO_USER`'s `~/coworker` under `sudo`.)
 - **`--dry-run`** (`-n`) prints the commands that half would run, one per line on stdout, and runs
   nothing; what's left for the other half (and the tools' installers) goes to stderr as `#` lines.
   Each half stops at the first command that fails.
@@ -252,7 +255,7 @@ A `DIR` is a project's checkout. Coworker's own `deps.json` (installed with the 
 counts too. Each `DIR` is remembered in `$COWORKER_HOME/projects/<project>` (a file holding the
 checkout's path), so with no `DIR` every project the machine has seen counts: setting up a machine
 is installing coworker, one `deps check` in each project, `deps install`, and the owner's
-`sudo ~/coworker/bin/deps install --sudo`. A remembered
+`sudo ~/coworker/bin/deps install --sudo` (or, as root, the full path). A remembered
 checkout that's gone is skipped and said; delete its file when the project is.
 
 ### `.coworker/deps.json`
@@ -301,7 +304,7 @@ Rules:
   firewall that filters by name lets the connection open and then never answers, so a connection
   alone proves nothing for HTTPS or HTTP.
 - **`sudo` is the owner's.** An agent runs `deps install` and never the `--sudo` half; when host
-  packages are missing it asks the owner to run `sudo ~/coworker/bin/deps install --sudo`.
+  packages are missing it asks the owner to run `sudo ~/coworker/bin/deps install --sudo` (or, as root, the full path).
 
 ### What a project needs of a VM
 

@@ -39,10 +39,16 @@ def euid():
 
 
 def coworker_home():
-    """$COWORKER_HOME, else ~/coworker; under sudo (which resets HOME and drops COWORKER_HOME), the
-    invoking user's ~/coworker, so root sees the same projects."""
+    """$COWORKER_HOME; else the home this copy is installed in (<home>/bin/deps beside <home>/VERSION),
+    so root sees the user's projects whether it came by sudo or a root login; else, run from a
+    checkout, under sudo (which resets HOME and drops COWORKER_HOME) the invoking user's ~/coworker,
+    and otherwise ~/coworker."""
     if os.environ.get("COWORKER_HOME"):
         return os.environ["COWORKER_HOME"]
+    here = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if os.path.basename(os.path.dirname(os.path.realpath(__file__))) == "bin" and \
+            os.path.isfile(os.path.join(here, "VERSION")):
+        return here
     if euid() == 0 and os.environ.get("SUDO_USER"):
         import pwd
         return os.path.join(pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir, "coworker")
@@ -54,7 +60,7 @@ PYTHON = os.environ.get("COWORKER_PYTHON", "python3")
 USAGE = ("usage: deps check [--no-network] [DIR...] | install [--dry-run] [DIR...] | install --sudo [--dry-run] [DIR...] (as root)"
          " | hosts [DIR...] | register DIR | vm-claim VM DIR | vm-guest VM [--wait SECONDS]")
 SSH = os.environ.get("COWORKER_SSH", "ssh")
-SUDO_HINT = "sudo ~/coworker/bin/deps install --sudo"
+SUDO_HINT = f"sudo {os.path.join(HOME, 'bin', 'deps')} install --sudo (or that, as root)"
 KEYS = {"host": "package", "pips": "pip", "network": "host", "tools": "tool"}
 ENTRY_KEYS = {"platform", "min", "max", "pin", "why", "port", "probe", "command", "path", "how"}
 
